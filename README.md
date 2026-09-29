@@ -65,7 +65,7 @@ Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na
 ## Mapowanie zdarzeń
 
 Narzędzia pomocniczych agentów (subagenci, agent uruchamiany przez hook `Stop`) mają w danych `agent_id`
-i nie zmieniają koloru. Diagnostyka: utwórz pusty plik `%LOCALAPPDATA%i-traffic-light\debug`,
+i nie zmieniają koloru. Diagnostyka: utwórz pusty plik `%LOCALAPPDATA%\ai-traffic-light\debug`,
 a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 
 | Zdarzenie | Stan |
