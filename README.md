@@ -42,18 +42,39 @@ python -m venv .venv
 2. Widget: `start.bat`.
 3. Hooki łapią się w **nowo uruchomionych** sesjach Claude Code.
 
-Prawy klik na sygnalizatorze: lista sesji, tryb warstwy, **Ustawienia…**, Zamknij.
-Lewy przycisk: przeciąganie. Kliknięcie w trybie „pod oknami” chowa widget z powrotem pod okna.
+Prawy klik na sygnalizatorze: przejście do czekającego agenta, lista sesji (kliknięcie przełącza do terminala),
+tryb warstwy, **Nie przeszkadzać**, **Ustawienia…**, Zamknij.
+Lewy przycisk: przeciąganie. Kliknięcie w kropkę sesji przełącza do jej terminala, a kliknięcie w kapsułę –
+do najdłużej czekającego agenta. W trybie „pod oknami” kliknięcie chowa też widget pod okna.
 Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na wierzch.
 
+## Co jeszcze robi widget
+
+- **Przejście do terminala** – hook zapisuje PID procesu agenta (`claude.exe`), a widget idzie w górę drzewa
+  procesów aż do okna terminala (Warp, Windows Terminal, VS Code…). Skrót globalny domyślnie `Ctrl+Alt+L`.
+  W terminalach z kartami przełącza do okna, nie do konkretnej karty.
+- **Przerwanie (Esc)** – co ~2 s widget sprawdza koniec zapisu rozmowy (`transcript_path`); wpis
+  „Request interrupted by user” od razu przestawia sesję na bezczynną.
+- **Zamknięty terminal** – sesja, której proces agenta już nie żyje, znika od razu (PID + czas utworzenia procesu).
+- **Liczniki** – w podpowiedzi i menu: jak długo sesja pracuje / czeka / jest bezczynna.
+- **Dźwięki** – gdy ktoś czeka, gdy agent skończy zadanie dłuższe niż próg (domyślnie 3 min) i gdy sesja
+  jest bezczynna od N minut (domyślnie 10). Widget celowo nie pokazuje dymków ani powiadomień Windows.
+- **Nie przeszkadzać** – ręcznie z menu, automatycznie przy aplikacji pełnoekranowej albo w ustawionych godzinach.
+  Kolor nadal się zmienia, ale bez wyskakiwania i dźwięków.
+
 ## Mapowanie zdarzeń
+
+Narzędzia pomocniczych agentów (subagenci, agent uruchamiany przez hook `Stop`) mają w danych `agent_id`
+i nie zmieniają koloru. Diagnostyka: utwórz pusty plik `%LOCALAPPDATA%i-traffic-light\debug`,
+a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 
 | Zdarzenie | Stan |
 |---|---|
 | `SessionStart`, `Stop` | bezczynny |
 | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | pracuje |
 | `Notification` (`permission_prompt`), `PreToolUse` dla `AskUserQuestion` / `ExitPlanMode` | czeka |
-| `Notification` (`idle_prompt`) | bezczynny |
+| `Stop`, gdy ostatni akapit odpowiedzi zawiera pytanie („Mam to zrobić?”) | czeka (opcja w Ustawienia → Zachowanie) |
+| `Notification` (`idle_prompt` i inne informacyjne) | bez zmiany |
 | `SessionEnd` | sesja znika |
 
 ## Inne CLI
@@ -73,7 +94,9 @@ Konfiguracji nie instalujemy automatycznie – przykłady:
 Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakładki:
 
 - **Zachowanie** – warstwa (zawsze na wierzchu / pod oknami), kiedy wyskakiwać, jak długo zostać na wierzchu,
-  czas do uznania sesji za zawieszoną, dźwięk przy pomarańczowym.
+  czas do uznania sesji za zawieszoną, skrót klawiszowy, kliknięcie przełącza do terminala, Nie przeszkadzać.
+- **Dźwięki** – dźwięk przy czekaniu, koniec długiego zadania (próg + dźwięk), przypomnienie o bezczynności
+  (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa (ciemna / jasna / szklana / automatyczna według jasności tła),
   obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ, kropki sesji.
 - **System** – autostart z Windows, instalacja/usunięcie hooków, folder stanu.

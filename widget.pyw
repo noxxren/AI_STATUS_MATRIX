@@ -5,9 +5,9 @@ Czerwone  - przynajmniej jeden pracuje
 Pomarańcz - ktoś czeka na Twoją odpowiedź (ma pierwszeństwo)
 
 Stan sesji zapisuje hook.py do %LOCALAPPDATA%\\ai-traffic-light\\sessions\\*.json.
-Widget tylko czyta te pliki. Uruchamiaj przez pythonw (bez okna konsoli).
+Widget czyta te pliki, dodatkowo wykrywa przerwania (Esc) i zamknięte sesje,
+przełącza do terminala agenta i gra dźwięki (bez dymków Windows). Uruchamiaj przez pythonw.
 """
-import ctypes
 import json
 import math
 import os
@@ -15,22 +15,28 @@ import sys
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QLockFile, QPoint, QPointF, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
+from PySide6.QtCore import QLockFile, QPoint, QPointF, QRectF, Qt, QTime, QTimer
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient,
+)
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-    QMenu, QPushButton, QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QKeySequenceEdit, QLabel, QMenu, QPushButton, QSlider, QSpinBox, QSystemTrayIcon, QTabWidget, QTimeEdit,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import install_hooks  # noqa: E402
+import winapi  # noqa: E402
 
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-traffic-light")
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+MEDIA_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Media")
 
 IDLE, WORKING, WAITING, STALE = "idle", "working", "waiting", "stale"
+BUSY = (WORKING, WAITING)
 LABEL = {IDLE: "bezczynny", WORKING: "pracuje", WAITING: "czeka na Ciebie", STALE: "brak sygnału"}
 CLI_NAME = {"claude": "Claude Code", "gemini": "Gemini CLI", "codex": "Codex CLI"}
 
@@ -39,9 +45,30 @@ LAMP_COLOR = {WORKING: RED, WAITING: AMBER, IDLE: GREEN}
 DOT_COLOR = {WORKING: QColor(217, 58, 43), WAITING: QColor(238, 143, 18), IDLE: QColor(31, 164, 99), STALE: GREY}
 
 DEFAULTS = {
+    # zachowanie
     "mode": "under",          # "top" | "under"
     "pop_rule": "any",        # "any" | "waiting"
     "pop_seconds": 5,         # 0 = zostaje na wierzchu do kliknięcia
+    "stale_minutes": 10,
+    "forget_hours": 12,
+    "hotkey": "Ctrl+Alt+L",   # przejdź do czekającego agenta; "" = wyłączony
+    "click_jumps": True,      # kliknięcie w sygnalizator przełącza do czekającego terminala
+    "question_waiting": True,  # odpowiedź zakończona pytaniem = czeka na Ciebie (pomarańczowe)
+    # nie przeszkadzać
+    "dnd_manual": False,
+    "dnd_fullscreen": True,
+    "dnd_hours": False,
+    "dnd_from": "22:00",
+    "dnd_to": "07:00",
+    # dźwięki ("" = brak, nazwa pliku z C:\Windows\Media albo pełna ścieżka .wav)
+    "sound_waiting": "",
+    "notify_long_task": True,
+    "long_task_minutes": 3,
+    "sound_long_task": "Windows Notify System Generic.wav",
+    "idle_remind": True,
+    "idle_remind_minutes": 10,
+    "sound_idle": "Windows Notify Calendar.wav",
+    # wygląd
     "scale": 1.25,
     "orientation": "vertical",
     "opacity": 0.85,
@@ -49,9 +76,7 @@ DEFAULTS = {
     "state_rim": True,        # obwódka i poświata w kolorze stanu
     "glow": 0.6,              # siła poświaty 0..1
     "show_dots": True,
-    "sound_on_waiting": False,
-    "stale_minutes": 10,
-    "forget_hours": 12,
+    # system
     "autostart": False,
     "pos": None,
 }
@@ -63,16 +88,7 @@ HOUSING = {
     "glass": ((255, 255, 255), 70, (255, 255, 255, 150), (255, 255, 255, 72)),
 }
 
-# ---------------------------------------------------------------- Windows z-order
-user32 = ctypes.windll.user32
-user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-user32.SetWindowPos.restype = wintypes.BOOL
-HWND_TOPMOST, HWND_NOTOPMOST, HWND_BOTTOM = -1, -2, 1
-SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
-
-
-def set_z(hwnd, where):
-    user32.SetWindowPos(hwnd, where, 0, 0, 0, 0, SWP_FLAGS)
+HOTKEY_ID = 0xA11
 
 
 # ---------------------------------------------------------------- config & sessions
@@ -80,9 +96,13 @@ def load_config():
     cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            stored = json.load(f)
     except (OSError, ValueError):
-        pass
+        stored = {}
+    # migracja: stare pole "sound_on_waiting" (bool) -> "sound_waiting" (dźwięk)
+    if stored.pop("sound_on_waiting", False) and "sound_waiting" not in stored:
+        stored["sound_waiting"] = "Windows Exclamation.wav"
+    cfg.update(stored)
     return cfg
 
 
@@ -94,6 +114,20 @@ def save_config(cfg):
     os.replace(tmp, CONFIG_PATH)
 
 
+def write_session(path, record):
+    rec = {k: v for k, v in record.items() if not k.startswith("_")}
+    tmp = f"{path}.w.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    for _ in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    _remove(tmp)
+
+
 def load_sessions(cfg):
     out, now = [], time.time()
     try:
@@ -101,9 +135,16 @@ def load_sessions(cfg):
     except OSError:
         return out
     for name in names:
+        path = os.path.join(SESSIONS_DIR, name)
+        if name.endswith(".tmp"):
+            try:
+                if now - os.path.getmtime(path) > 60:
+                    os.remove(path)  # osierocony plik po nieudanym zapisie
+            except OSError:
+                pass
+            continue
         if not name.endswith(".json"):
             continue
-        path = os.path.join(SESSIONS_DIR, name)
         try:
             with open(path, encoding="utf-8") as f:
                 s = json.load(f)
@@ -111,17 +152,25 @@ def load_sessions(cfg):
             continue
         age = now - float(s.get("ts", 0))
         if age > cfg["forget_hours"] * 3600:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            _remove(path)
             continue
-        if s.get("state") in (WORKING, WAITING) and age > cfg["stale_minutes"] * 60:
+        s["_raw_state"] = s.get("state")
+        if s.get("state") == IDLE and s.get("question") and cfg["question_waiting"]:
+            s["state"] = WAITING  # agent skończył odpowiedź pytaniem i czeka na Ciebie
+        # "brak sygnału" tylko dla pracy bez zdarzeń; czekanie na Ciebie może trwać dowolnie długo
+        if s.get("state") == WORKING and age > cfg["stale_minutes"] * 60:
             s["state"] = STALE
         s["_path"] = path
         out.append(s)
     out.sort(key=lambda s: (s.get("project", ""), s.get("session_id", "")))
     return out
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def aggregate(sessions):
@@ -133,6 +182,90 @@ def aggregate(sessions):
     return IDLE
 
 
+def transcript_interrupted(path, since_ts):
+    """True, jeśli ostatni wpis rozmowy to przerwanie przez użytkownika (Esc)."""
+    try:
+        st = os.stat(path)
+        if st.st_mtime < since_ts - 1:
+            return False  # od ostatniego zdarzenia nic nie dopisano
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        kind = obj.get("type")
+        if kind == "assistant":
+            return False
+        if kind != "user":
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+        return "[Request interrupted by user" in str(content)
+    return False
+
+
+def fmt_duration(sec):
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec} s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}:{s:02d}"
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------- sounds
+def sound_path(spec):
+    if not spec:
+        return None
+    return spec if os.path.isabs(spec) else os.path.join(MEDIA_DIR, spec)
+
+
+def play_sound(spec):
+    path = sound_path(spec)
+    if not path or not os.path.exists(path):
+        return
+    import winsound
+    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+
+# ---------------------------------------------------------------- hotkey
+def parse_hotkey(text):
+    """"Ctrl+Alt+L" -> (mods, vk) dla RegisterHotKey, albo None."""
+    seq = QKeySequence(text or "")
+    if seq.isEmpty():
+        return None
+    combo = seq[0]
+    mods_q, key = combo.keyboardModifiers(), combo.key()
+    mods = 0
+    if mods_q & Qt.ControlModifier:
+        mods |= winapi.MOD_CONTROL
+    if mods_q & Qt.AltModifier:
+        mods |= winapi.MOD_ALT
+    if mods_q & Qt.ShiftModifier:
+        mods |= winapi.MOD_SHIFT
+    if mods_q & Qt.MetaModifier:
+        mods |= winapi.MOD_WIN
+    k = int(key.value) if hasattr(key, "value") else int(key)
+    if Qt.Key_A.value <= k <= Qt.Key_Z.value or Qt.Key_0.value <= k <= Qt.Key_9.value:
+        vk = k
+    elif Qt.Key_F1.value <= k <= Qt.Key_F24.value:
+        vk = 0x70 + (k - Qt.Key_F1.value)
+    elif k == Qt.Key_Space.value:
+        vk = 0x20
+    else:
+        return None
+    return mods, vk
+
+
+# ---------------------------------------------------------------- system
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "AITrafficLight"
 
@@ -158,6 +291,14 @@ def hooks_installed():
         return False
 
 
+def in_quiet_hours(cfg):
+    now = QTime.currentTime()
+    a, b = QTime.fromString(cfg["dnd_from"], "HH:mm"), QTime.fromString(cfg["dnd_to"], "HH:mm")
+    if not a.isValid() or not b.isValid() or a == b:
+        return False
+    return a <= now < b if a < b else (now >= a or now < b)
+
+
 # ---------------------------------------------------------------- the widget
 class Light(QWidget):
     def __init__(self, cfg):
@@ -174,6 +315,10 @@ class Light(QWidget):
         self._pop_t0 = -10.0
         self._drag = None
         self._moved = False
+        self._prev = None            # {session_id: state} z poprzedniego odczytu
+        self._reminded = set()       # (session_id, since) – przypomnienia o bezczynności już wysłane
+        self._last_deep_check = 0.0
+        self._hotkey_on = False
 
         self.poll = QTimer(self, interval=300, timeout=self.refresh)
         self.anim = QTimer(self, interval=33, timeout=self._tick)
@@ -212,6 +357,18 @@ class Light(QWidget):
         self.setFixedSize(math.ceil(w), math.ceil(h))
         self.update()
 
+    def body_rect(self, g=None):
+        g = g or self.dims()
+        return QRectF(self.width() / 2 - g["cw"] / 2, g["m"], g["cw"], g["ch"])
+
+    def dot_centers(self, g=None):
+        g = g or self.dims()
+        if not g["n"]:
+            return []
+        y = self.body_rect(g).bottom() + g["dtop"] + g["dot"] / 2
+        x0 = self.width() / 2 - g["dots_w"] / 2 + g["dot"] / 2
+        return [QPointF(x0 + i * (g["dot"] + g["dgap"]), y) for i in range(g["n"])]
+
     def restore_pos(self):
         pos = self.cfg.get("pos")
         screen = QApplication.primaryScreen().availableGeometry()
@@ -223,19 +380,71 @@ class Light(QWidget):
     # ---- state
     def refresh(self, initial=False):
         prev_n = len(self.sessions)
-        self.sessions = load_sessions(self.cfg)
-        if len(self.sessions) != prev_n and self.cfg["show_dots"]:
+        sessions = load_sessions(self.cfg)
+        now = time.time()
+        if initial or now - self._last_deep_check > 2:
+            self._last_deep_check = now
+            sessions = self.deep_check(sessions, now)
+        self.sessions = sessions
+        if len(sessions) != prev_n and self.cfg["show_dots"]:
             self.relayout()
-        new = aggregate(self.sessions)
+
+        new = aggregate(sessions)
         changed = new != self.state
         self.state = new
         self.setToolTip(self.tooltip_text())
         self.tray.setToolTip("Sygnalizator AI: " + self.caption())
         self.tray.setIcon(self.tray_icon())
+
+        events = self.session_events(sessions, now, initial)
         if changed and not initial:
             self.on_change(new)
+        if events and not initial:
+            self.notify(events)
         self._sync_anim()
         self.update()
+
+    def deep_check(self, sessions, now):
+        """Co ~2 s: usuń sesje zamkniętych procesów, wykryj przerwanie klawiszem Esc."""
+        alive = []
+        for s in sessions:
+            pid = s.get("pid")
+            if pid and winapi.process_alive(pid, s.get("pid_created")) is False:
+                _remove(s["_path"])
+                continue
+            if (s.get("_raw_state") in BUSY and s.get("transcript_path") and now - float(s.get("ts", 0)) > 2
+                    and transcript_interrupted(s["transcript_path"], float(s.get("ts", 0)))):
+                s.update(state=IDLE, _raw_state=IDLE, event="Interrupted", detail="przerwane przez użytkownika",
+                         ts=now, since=now, work_started=None)
+                try:
+                    write_session(s["_path"], s)
+                except OSError:
+                    pass
+            alive.append(s)
+        return alive
+
+    def session_events(self, sessions, now, initial):
+        """Przejścia stanów sesji -> lista zdarzeń do powiadomienia."""
+        events = []
+        prev = self._prev or {}
+        for s in sessions:
+            sid, st = s.get("session_id"), s.get("state")
+            before = prev.get(sid)
+            if self._prev is not None and before != st:
+                if st == WAITING:
+                    events.append(("waiting", s))
+                elif st == IDLE and before in BUSY and s.get("event") != "Interrupted":
+                    dur = s.get("last_work_seconds") or 0
+                    if self.cfg["notify_long_task"] and dur >= self.cfg["long_task_minutes"] * 60:
+                        events.append(("done", s))
+            if st == IDLE and self.cfg["idle_remind"] and s.get("since"):
+                key = (sid, s["since"])
+                if key not in self._reminded and now - float(s["since"]) >= self.cfg["idle_remind_minutes"] * 60:
+                    self._reminded.add(key)
+                    if not initial:
+                        events.append(("idle", s))
+        self._prev = {s.get("session_id"): s.get("state") for s in sessions}
+        return events
 
     def caption(self):
         n_wait = sum(s["state"] == WAITING for s in self.sessions)
@@ -246,26 +455,92 @@ class Light(QWidget):
             return f"{n_work} pracuje"
         return "wszyscy wolni" if self.sessions else "brak aktywnych sesji"
 
+    def session_line(self, s):
+        cli = CLI_NAME.get(s.get("cli"), s.get("cli", ""))
+        line = f"{s.get('project', '?')} · {cli} — {LABEL[s['state']]}"
+        if s.get("since") and s["state"] != STALE:
+            line += f" {fmt_duration(time.time() - float(s['since']))}"
+        return line
+
     def tooltip_text(self):
         if not self.sessions:
-            return "Brak aktywnych sesji"
-        lines = []
-        for s in self.sessions:
-            cli = CLI_NAME.get(s.get("cli"), s.get("cli", ""))
-            line = f"{s.get('project', '?')} · {cli} — {LABEL[s['state']]}"
-            if s["state"] in (WORKING, WAITING) and s.get("detail"):
-                line += f"\n    {s['detail']}"
-            lines.append(line)
-        return "\n".join(lines)
+            text = "Brak aktywnych sesji"
+        else:
+            lines = []
+            for s in self.sessions:
+                line = self.session_line(s)
+                if s["state"] in BUSY and s.get("detail"):
+                    line += f"\n    {s['detail']}"
+                lines.append(line)
+            text = "\n".join(lines)
+        if self.dnd_active():
+            text += "\n\nNie przeszkadzać: włączone"
+        return text
+
+    # ---- nie przeszkadzać & powiadomienia
+    def dnd_active(self):
+        c = self.cfg
+        if c["dnd_manual"] or (c["dnd_hours"] and in_quiet_hours(c)):
+            return True
+        return bool(c["dnd_fullscreen"] and winapi.fullscreen_app_active())
 
     def on_change(self, new):
-        if new == WAITING and self.cfg["sound_on_waiting"]:
-            import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        if self.dnd_active():
+            return
         if self.cfg["mode"] == "under" and (self.cfg["pop_rule"] == "any" or new == WAITING):
             self.pop()
         elif self.cfg["mode"] == "top":
             self._pop_t0 = time.monotonic()  # sama animacja, bez zmiany warstwy
+
+    def notify(self, events):
+        """Tylko dźwięki – bez dymków Windows; resztę mówi sam sygnalizator."""
+        if self.dnd_active():
+            return
+        kinds = {k for k, _ in events}
+        if "waiting" in kinds:
+            play_sound(self.cfg["sound_waiting"])
+        elif "done" in kinds:
+            play_sound(self.cfg["sound_long_task"])
+        elif "idle" in kinds:
+            play_sound(self.cfg["sound_idle"])
+
+    # ---- przejście do terminala
+    def focus_session(self, s):
+        hwnd = winapi.terminal_window(s.get("pid"))
+        return bool(hwnd and winapi.focus_window(hwnd))
+
+    def attention_session(self):
+        """Sesja, która najbardziej potrzebuje uwagi: najdłużej czekająca, potem ostatnio aktywna."""
+        waiting = [s for s in self.sessions if s["state"] == WAITING]
+        if waiting:
+            return min(waiting, key=lambda s: float(s.get("since") or 0))
+        if self.sessions:
+            return max(self.sessions, key=lambda s: float(s.get("ts") or 0))
+        return None
+
+    def jump_to_attention(self):
+        s = self.attention_session()
+        if s:
+            self.focus_session(s)
+        else:
+            self.pop()
+
+    def register_hotkey(self):
+        if self._hotkey_on:
+            winapi.unregister_hotkey(self.hwnd(), HOTKEY_ID)
+            self._hotkey_on = False
+        parsed = parse_hotkey(self.cfg["hotkey"])
+        if parsed:
+            self._hotkey_on = winapi.register_hotkey(self.hwnd(), HOTKEY_ID, *parsed)
+        return self._hotkey_on
+
+    def nativeEvent(self, event_type, message):
+        if event_type == b"windows_generic_MSG":
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == winapi.WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                self.jump_to_attention()
+                return True, 0
+        return super().nativeEvent(event_type, message)
 
     # ---- z-order
     def hwnd(self):
@@ -275,13 +550,13 @@ class Light(QWidget):
         self.unpop.stop()
         self.popped = False
         if self.cfg["mode"] == "top":
-            set_z(self.hwnd(), HWND_TOPMOST)
+            winapi.set_z(self.hwnd(), winapi.HWND_TOPMOST)
         else:
-            set_z(self.hwnd(), HWND_NOTOPMOST)
-            set_z(self.hwnd(), HWND_BOTTOM)
+            winapi.set_z(self.hwnd(), winapi.HWND_NOTOPMOST)
+            winapi.set_z(self.hwnd(), winapi.HWND_BOTTOM)
 
     def pop(self):
-        set_z(self.hwnd(), HWND_TOPMOST)
+        winapi.set_z(self.hwnd(), winapi.HWND_TOPMOST)
         self.popped = True
         self._pop_t0 = time.monotonic()
         self._sync_anim()
@@ -360,8 +635,7 @@ class Light(QWidget):
         now = time.monotonic()
         t = now - self._pop_t0
 
-        cx = self.width() / 2
-        body = QRectF(cx - g["cw"] / 2, g["m"], g["cw"], g["ch"])
+        body = self.body_rect(g)
         radius = min(g["cw"], g["ch"]) / 2
 
         # animacja "pop": sprężyste powiększenie
@@ -418,8 +692,7 @@ class Light(QWidget):
             p.drawPath(ring)
 
         # lampy
-        order = (WORKING, WAITING, IDLE)
-        for i, st in enumerate(order):
+        for i, st in enumerate((WORKING, WAITING, IDLE)):
             off = g["pad"] + i * (g["d"] + g["gap"]) + g["d"] / 2
             if self.cfg["orientation"] == "vertical":
                 c = QPointF(body.center().x(), body.top() + off)
@@ -445,13 +718,9 @@ class Light(QWidget):
             p.drawEllipse(c, r, r)
 
         # kropki sesji
-        if g["n"]:
-            y = body.bottom() + g["dtop"] + g["dot"] / 2
-            x = cx - g["dots_w"] / 2 + g["dot"] / 2
-            for s in self.sessions:
-                p.setBrush(DOT_COLOR.get(s["state"], GREY))
-                p.drawEllipse(QPointF(x, y), g["dot"] / 2, g["dot"] / 2)
-                x += g["dot"] + g["dgap"]
+        for s, c in zip(self.sessions, self.dot_centers(g)):
+            p.setBrush(DOT_COLOR.get(s["state"], GREY))
+            p.drawEllipse(c, g["dot"] / 2, g["dot"] / 2)
         p.end()
 
     def tray_icon(self):
@@ -462,7 +731,10 @@ class Light(QWidget):
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(16, 19, 23))
         p.drawRoundedRect(QRectF(2, 2, 28, 28), 14, 14)
-        p.setBrush(LAMP_COLOR[self.state])
+        col = QColor(LAMP_COLOR[self.state])
+        if self.cfg["dnd_manual"]:
+            col.setAlphaF(0.4)
+        p.setBrush(col)
         p.drawEllipse(QPointF(16, 16), 8, 8)
         p.end()
         return QIcon(pm)
@@ -485,8 +757,22 @@ class Light(QWidget):
         if self._moved:
             self.cfg["pos"] = [self.x(), self.y()]
             save_config(self.cfg)
+        else:
+            self.handle_click(e.position())
         if self.cfg["mode"] == "under":
             self.apply_layer()  # kliknięcie = "widzę, schowaj"
+
+    def handle_click(self, pos):
+        g = self.dims()
+        hit = max(g["dot"] / 2 + g["dgap"] / 2, 5)
+        for s, c in zip(self.sessions, self.dot_centers(g)):
+            if abs(pos.x() - c.x()) <= hit and abs(pos.y() - c.y()) <= hit + 2:
+                self.focus_session(s)
+                return
+        if self.cfg["click_jumps"]:
+            waiting = [s for s in self.sessions if s["state"] == WAITING]
+            if waiting:
+                self.focus_session(min(waiting, key=lambda s: float(s.get("since") or 0)))
 
     def contextMenuEvent(self, e):
         menu = QMenu(self)
@@ -505,12 +791,19 @@ class Light(QWidget):
         head = menu.addAction(f"Sygnalizator AI · {self.caption()}")
         head.setEnabled(False)
 
+        target = self.attention_session()
+        if target:
+            label = "Przejdź do czekającego agenta" if target["state"] == WAITING else "Przejdź do ostatniej sesji"
+            a = menu.addAction(f"{label}: {target.get('project', '?')}", lambda *_, s=target: self.focus_session(s))
+            if self._hotkey_on:
+                a.setShortcut(QKeySequence(self.cfg["hotkey"]))
+                a.setShortcutVisibleInContextMenu(True)
+
         sub = menu.addMenu(f"Sesje ({len(self.sessions)})")
         if not self.sessions:
             sub.addAction("Brak aktywnych sesji").setEnabled(False)
         for s in self.sessions:
-            cli = CLI_NAME.get(s.get("cli"), s.get("cli", ""))
-            a = sub.addAction(f"{s.get('project', '?')} · {cli} — {LABEL[s['state']]}")
+            a = sub.addAction(self.session_line(s), lambda *_, s=s: self.focus_session(s))
             a.setIcon(self._dot_icon(DOT_COLOR.get(s["state"], GREY)))
             a.setToolTip(s.get("cwd", ""))
         sub.addSeparator()
@@ -523,6 +816,9 @@ class Light(QWidget):
             a.triggered.connect(lambda _=False, k=key: self.set_mode(k))
             grp.addAction(a)
             menu.addAction(a)
+        dnd = QAction("Nie przeszkadzać", menu, checkable=True, checked=self.cfg["dnd_manual"])
+        dnd.triggered.connect(self.toggle_dnd)
+        menu.addAction(dnd)
 
         menu.addSeparator()
         menu.addAction("Ustawienia…", self.open_settings)
@@ -546,18 +842,20 @@ class Light(QWidget):
         save_config(self.cfg)
         self.apply_layer()
 
+    def toggle_dnd(self, on):
+        self.cfg["dnd_manual"] = bool(on)
+        save_config(self.cfg)
+        self.refresh()
+
     def clear_sessions(self):
         for s in self.sessions:
-            try:
-                os.remove(s["_path"])
-            except OSError:
-                pass
+            _remove(s["_path"])
         self.refresh()
 
     def open_settings(self):
         before = dict(self.cfg)
         dlg = SettingsDialog(self.cfg, self.preview)
-        set_z(int(dlg.winId()), HWND_TOPMOST)
+        winapi.set_z(int(dlg.winId()), winapi.HWND_TOPMOST)
         if dlg.exec() == QDialog.Accepted:
             self.cfg.update(dlg.values())
             save_config(self.cfg)
@@ -568,6 +866,7 @@ class Light(QWidget):
         else:
             self.cfg.clear()
             self.cfg.update(before)
+        self.register_hotkey()
         self.apply_appearance()
         self.apply_layer()
         self.refresh()
@@ -593,11 +892,64 @@ STYLE_PRESETS = [
 
 
 # ---------------------------------------------------------------- settings dialog
+class SoundPicker(QWidget):
+    """Lista dźwięków (Brak / dźwięki Windows / własny plik) z przyciskiem odtwarzania."""
+    BROWSE = "__browse__"
+
+    def __init__(self, value):
+        super().__init__()
+        self.combo = QComboBox()
+        self.combo.setMinimumWidth(220)
+        self.combo.addItem("Brak", "")
+        try:
+            names = sorted(n for n in os.listdir(MEDIA_DIR) if n.lower().endswith(".wav"))
+        except OSError:
+            names = []
+        for n in names:
+            self.combo.addItem(n[:-4], n)
+        if value and self.combo.findData(value) < 0:
+            self.combo.addItem(os.path.basename(value), value)
+        self.combo.addItem("Wybierz plik .wav…", self.BROWSE)
+        self.combo.setCurrentIndex(max(self.combo.findData(value), 0))
+        self._last = self.combo.currentIndex()
+        self.combo.currentIndexChanged.connect(self._picked)
+
+        play = QToolButton(text="▶")
+        play.setToolTip("Odtwórz")
+        play.clicked.connect(lambda: play_sound(self.value()))
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self.combo, 1)
+        h.addWidget(play)
+
+    def _picked(self, idx):
+        if self.combo.itemData(idx) != self.BROWSE:
+            self._last = idx
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Wybierz dźwięk", MEDIA_DIR, "Dźwięki (*.wav)")
+        self.combo.blockSignals(True)
+        if path:
+            path = os.path.normpath(path)
+            at = self.combo.count() - 1
+            self.combo.insertItem(at, os.path.basename(path), path)
+            self.combo.setCurrentIndex(at)
+            self._last = at
+            play_sound(path)
+        else:
+            self.combo.setCurrentIndex(self._last)
+        self.combo.blockSignals(False)
+
+    def value(self):
+        v = self.combo.currentData()
+        return "" if v == self.BROWSE else v
+
+
 class SettingsDialog(QDialog):
     def __init__(self, cfg, on_preview=None):
         super().__init__(None, Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle("Sygnalizator AI — ustawienia")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self._on_preview = on_preview
         self._loading = True
 
@@ -611,7 +963,34 @@ class SettingsDialog(QDialog):
         self.pop_seconds = QSpinBox(minimum=0, maximum=600, suffix=" s")
         self.pop_seconds.setSpecialValueText("do kliknięcia")
         self.stale = QSpinBox(minimum=1, maximum=240, suffix=" min")
-        self.sound = QCheckBox("Dźwięk, gdy ktoś zaczyna czekać na odpowiedź")
+        self.hotkey = QKeySequenceEdit(QKeySequence(cfg["hotkey"]))
+        if hasattr(self.hotkey, "setMaximumSequenceLength"):
+            self.hotkey.setMaximumSequenceLength(1)
+        if hasattr(self.hotkey, "setClearButtonEnabled"):
+            self.hotkey.setClearButtonEnabled(True)
+        self.hotkey_lbl = QLabel()
+        self.hotkey_lbl.setObjectName("hint")
+        self.hotkey.keySequenceChanged.connect(self._check_hotkey)
+        self.click_jumps = QCheckBox("Kliknięcie w sygnalizator przełącza do czekającego terminala")
+        self.question_waiting = QCheckBox("Odpowiedź agenta zakończona pytaniem = czeka na Ciebie (pomarańczowe)")
+
+        # --- Nie przeszkadzać (w zakładce Zachowanie)
+        self.dnd_fullscreen = QCheckBox("Gdy aplikacja jest na pełnym ekranie (prezentacja, gra, wideo)")
+        self.dnd_hours = QCheckBox("W godzinach")
+        self.dnd_from = QTimeEdit(QTime.fromString(cfg["dnd_from"], "HH:mm"), displayFormat="HH:mm")
+        self.dnd_to = QTimeEdit(QTime.fromString(cfg["dnd_to"], "HH:mm"), displayFormat="HH:mm")
+        self.dnd_hours.toggled.connect(lambda on: (self.dnd_from.setEnabled(on), self.dnd_to.setEnabled(on)))
+
+        # --- Dźwięki
+        self.sound_waiting = SoundPicker(cfg["sound_waiting"])
+        self.notify_long = QCheckBox("Zagraj dźwięk, gdy agent skończy długie zadanie")
+        self.long_minutes = QSpinBox(minimum=1, maximum=240, suffix=" min")
+        self.sound_long = SoundPicker(cfg["sound_long_task"])
+        self.idle_remind = QCheckBox("Zagraj dźwięk, gdy sesja długo czeka na kolejne polecenie")
+        self.idle_minutes = QSpinBox(minimum=1, maximum=480, suffix=" min")
+        self.sound_idle = SoundPicker(cfg["sound_idle"])
+        self.notify_long.toggled.connect(lambda on: (self.long_minutes.setEnabled(on), self.sound_long.setEnabled(on)))
+        self.idle_remind.toggled.connect(lambda on: (self.idle_minutes.setEnabled(on), self.sound_idle.setEnabled(on)))
 
         # --- Wygląd
         self.preset = QComboBox()
@@ -651,23 +1030,75 @@ class SettingsDialog(QDialog):
             combo.setCurrentIndex(max(combo.findData(cfg[key]), 0))
         self.pop_seconds.setValue(int(cfg["pop_seconds"]))
         self.stale.setValue(int(cfg["stale_minutes"]))
-        self.sound.setChecked(cfg["sound_on_waiting"])
+        self.click_jumps.setChecked(cfg["click_jumps"])
+        self.question_waiting.setChecked(cfg["question_waiting"])
+        self.dnd_fullscreen.setChecked(cfg["dnd_fullscreen"])
+        self.dnd_hours.setChecked(cfg["dnd_hours"])
+        self.dnd_from.setEnabled(cfg["dnd_hours"])
+        self.dnd_to.setEnabled(cfg["dnd_hours"])
+        self.notify_long.setChecked(cfg["notify_long_task"])
+        self.long_minutes.setValue(int(cfg["long_task_minutes"]))
+        self.long_minutes.setEnabled(cfg["notify_long_task"])
+        self.sound_long.setEnabled(cfg["notify_long_task"])
+        self.idle_remind.setChecked(cfg["idle_remind"])
+        self.idle_minutes.setValue(int(cfg["idle_remind_minutes"]))
+        self.idle_minutes.setEnabled(cfg["idle_remind"])
+        self.sound_idle.setEnabled(cfg["idle_remind"])
         self.state_rim.setChecked(cfg["state_rim"])
         self.glow.setValue(int(cfg["glow"] * 100))
         self.opacity.setValue(int(cfg["opacity"] * 100))
         self.show_dots.setChecked(cfg["show_dots"])
         self.autostart.setChecked(cfg["autostart"])
+        self._check_hotkey()
 
         # --- zakładki
+        hours = QWidget()
+        hh = QHBoxLayout(hours)
+        hh.setContentsMargins(0, 0, 0, 0)
+        hh.addWidget(self.dnd_hours)
+        hh.addWidget(self.dnd_from)
+        hh.addWidget(QLabel("–"))
+        hh.addWidget(self.dnd_to)
+        hh.addStretch(1)
+        hotkey_box = QWidget()
+        hk_v = QVBoxLayout(hotkey_box)
+        hk_v.setContentsMargins(0, 0, 0, 0)
+        hk_v.setSpacing(3)
+        hk_v.addWidget(self.hotkey)
+        hk_v.addWidget(self.hotkey_lbl)
+
         tabs = QTabWidget()
         tabs.addTab(self._page([
             ("Warstwa", self.mode),
             ("Wyskakuj", self.pop_rule),
             ("Na wierzchu przez", self.pop_seconds),
             ("Zawieszona sesja po", self.stale),
-            ("", self.sound),
-        ], "Sesja, która pracuje albo czeka bez żadnego zdarzenia dłużej niż ustawiony czas "
-           "(np. po przerwaniu klawiszem Esc), dostaje szarą kropkę i przestaje wpływać na kolor."), "Zachowanie")
+            ("", self.question_waiting),
+            None,
+            ("Skrót do agenta", hotkey_box),
+            ("", self.click_jumps),
+            None,
+            "Nie przeszkadzać",
+            ("", self.dnd_fullscreen),
+            ("", hours),
+        ], "W trybie „Nie przeszkadzać” sygnalizator nadal zmienia kolor, ale nie wyskakuje na wierzch, "
+           "nie gra dźwięków. Można go też włączyć ręcznie w menu pod prawym przyciskiem."),
+            "Zachowanie")
+        tabs.addTab(self._page([
+            "Ktoś czeka na odpowiedź",
+            ("Dźwięk", self.sound_waiting),
+            None,
+            "Koniec długiego zadania",
+            ("", self.notify_long),
+            ("Zadanie trwające od", self.long_minutes),
+            ("Dźwięk", self.sound_long),
+            None,
+            "Bezczynna sesja",
+            ("", self.idle_remind),
+            ("Bezczynna od", self.idle_minutes),
+            ("Dźwięk", self.sound_idle),
+        ], "Tylko dźwięki – widget nie pokazuje dymków Windows. Przycisk ▶ odtwarza wybrany dźwięk. "
+           "W trybie „Nie przeszkadzać” dźwięki są wyciszone."), "Dźwięki")
         tabs.addTab(self._page([
             ("Gotowy styl", self.preset),
             None,
@@ -731,10 +1162,10 @@ class SettingsDialog(QDialog):
     def _page(rows, hint_text):
         page = QWidget()
         v = QVBoxLayout(page)
-        v.setContentsMargins(14, 14, 14, 12)
+        v.setContentsMargins(14, 12, 14, 12)
         form = QFormLayout()
         form.setHorizontalSpacing(16)
-        form.setVerticalSpacing(10)
+        form.setVerticalSpacing(9)
         for row in rows:
             if row is None:
                 line = QWidget()
@@ -742,6 +1173,10 @@ class SettingsDialog(QDialog):
                 line.setObjectName("rule")
                 line.setAttribute(Qt.WA_StyledBackground)
                 form.addRow(line)
+            elif isinstance(row, str):
+                lbl = QLabel(row.upper())
+                lbl.setObjectName("section")
+                form.addRow(lbl)
             else:
                 form.addRow(row[0], row[1])
         v.addLayout(form)
@@ -756,6 +1191,15 @@ class SettingsDialog(QDialog):
         under = self.mode.currentData() == "under"
         self.pop_rule.setEnabled(under)
         self.pop_seconds.setEnabled(under)
+
+    def _check_hotkey(self):
+        text = self.hotkey.keySequence().toString()
+        if not text:
+            self.hotkey_lbl.setText("Wyłączony. Kliknij pole i naciśnij kombinację klawiszy.")
+        elif parse_hotkey(text) is None:
+            self.hotkey_lbl.setText("Nieobsługiwany klawisz: użyj litery, cyfry, F1–F24 albo spacji z Ctrl/Alt/Shift/Win.")
+        else:
+            self.hotkey_lbl.setText("Przełącza do najdłużej czekającego agenta, a gdy nikt nie czeka, do ostatniej sesji.")
 
     def _apply_preset(self):
         data = self.preset.currentData()
@@ -798,12 +1242,26 @@ class SettingsDialog(QDialog):
         self._refresh_hooks()
 
     def values(self):
+        hotkey = self.hotkey.keySequence().toString()
         return {
             "mode": self.mode.currentData(),
             "pop_rule": self.pop_rule.currentData(),
             "pop_seconds": self.pop_seconds.value(),
             "stale_minutes": self.stale.value(),
-            "sound_on_waiting": self.sound.isChecked(),
+            "hotkey": hotkey if parse_hotkey(hotkey) else "",
+            "click_jumps": self.click_jumps.isChecked(),
+            "question_waiting": self.question_waiting.isChecked(),
+            "dnd_fullscreen": self.dnd_fullscreen.isChecked(),
+            "dnd_hours": self.dnd_hours.isChecked(),
+            "dnd_from": self.dnd_from.time().toString("HH:mm"),
+            "dnd_to": self.dnd_to.time().toString("HH:mm"),
+            "sound_waiting": self.sound_waiting.value(),
+            "notify_long_task": self.notify_long.isChecked(),
+            "long_task_minutes": self.long_minutes.value(),
+            "sound_long_task": self.sound_long.value(),
+            "idle_remind": self.idle_remind.isChecked(),
+            "idle_remind_minutes": self.idle_minutes.value(),
+            "sound_idle": self.sound_idle.value(),
             "housing": self.housing.currentData(),
             "state_rim": self.state_rim.isChecked(),
             "glow": self.glow.value() / 100,
@@ -826,7 +1284,7 @@ QMenu::separator { height: 1px; background: #2E3640; margin: 4px 6px; }
 QMenu::indicator { width: 12px; height: 12px; margin-left: 4px; }
 QDialog { background: #14181D; color: #E6EDF2; }
 QLabel { color: #C9D2DA; }
-QLabel#section { color: #7F8B97; font-size: 8pt; letter-spacing: 1px; padding-top: 8px; }
+QLabel#section { color: #7F8B97; font-size: 8pt; letter-spacing: 1px; padding-top: 4px; }
 QLabel#hint { color: #7F8B97; font-size: 8.5pt; }
 QWidget#rule { background: #262D36; }
 QTabWidget::pane { border: 1px solid #262D36; border-radius: 8px; top: -1px; background: #171B21; }
@@ -835,13 +1293,15 @@ QTabBar::tab:selected { color: #E6EDF2; background: #171B21; border-color: #262D
 QTabBar::tab:hover:!selected { color: #C9D2DA; }
 QSlider::groove:horizontal:disabled { background: #22282F; }
 QSlider::handle:horizontal:disabled { background: #4A535D; }
-QComboBox, QSpinBox { background: #1C2128; color: #E6EDF2; border: 1px solid #2E3640; border-radius: 6px; padding: 4px 8px; min-height: 20px; }
-QComboBox:focus, QSpinBox:focus { border-color: #4C8DFF; }
+QComboBox, QSpinBox, QTimeEdit, QLineEdit { background: #1C2128; color: #E6EDF2; border: 1px solid #2E3640; border-radius: 6px; padding: 4px 8px; min-height: 20px; }
+QComboBox:focus, QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus { border-color: #4C8DFF; }
 QComboBox QAbstractItemView { background: #1C2128; color: #E6EDF2; border: 1px solid #2E3640; selection-background-color: #2A3340; }
-QComboBox:disabled, QSpinBox:disabled { color: #5F6B77; }
+QComboBox:disabled, QSpinBox:disabled, QTimeEdit:disabled { color: #5F6B77; }
 QCheckBox { color: #E6EDF2; spacing: 8px; }
-QPushButton { background: #232A33; color: #E6EDF2; border: 1px solid #333C47; border-radius: 6px; padding: 5px 14px; }
-QPushButton:hover { background: #2B333E; }
+QPushButton, QToolButton { background: #232A33; color: #E6EDF2; border: 1px solid #333C47; border-radius: 6px; padding: 5px 14px; }
+QToolButton { padding: 4px 9px; }
+QPushButton:hover, QToolButton:hover { background: #2B333E; }
+QToolButton:disabled { color: #5F6B77; }
 QPushButton:default { background: #E6EDF2; color: #14181D; border-color: #E6EDF2; }
 QSlider::groove:horizontal { height: 4px; background: #2E3640; border-radius: 2px; }
 QSlider::handle:horizontal { width: 14px; margin: -5px 0; background: #E6EDF2; border-radius: 7px; }
@@ -859,6 +1319,7 @@ def main():
     w = Light(load_config())
     w.show()
     w.apply_layer()
+    w.register_hotkey()
     if w.cfg["mode"] == "under":
         w.pop()  # pokaż się po starcie, potem wróć pod okna
     sys.exit(app.exec())
