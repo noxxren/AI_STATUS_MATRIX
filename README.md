@@ -1,18 +1,20 @@
-# Sygnalizator AI
+# AI_STATUS_WIDGET
 
 Minimalistyczny widget na pulpit Windows, który pokazuje, co robią agenci AI w terminalach.
+Domyślny układ to **Matrix** – kwadratowy ekran na każdą sesję (terminal); w ustawieniach można przełączyć
+na klasyczny sygnalizator, jedno światło albo korektor.
 
-| Światło | Znaczenie |
-|---|---|
-| zielone | wszyscy agenci bezczynni |
-| czerwone | przynajmniej jeden pracuje |
-| pomarańczowe (pulsuje) | ktoś czeka na Twoją odpowiedź; ma pierwszeństwo przed czerwonym |
-| niebieskie (ładowanie) | agent kompaktuje kontekst rozmowy (`/compact` albo automatycznie) |
-| magentowy glitch | tura skończyła się błędem API albo sesja „pracuje” bez żadnych zdarzeń (zawieszona) |
-| wygaszony, szary (Matrix: szum) | brak jakiejkolwiek sesji – agent nie działa albo hooki nie są zainstalowane |
+| Sygnalizator | Matrix | Znaczenie |
+|---|---|---|
+| zielone | biało-turkusowy kursor `>_` | wszyscy agenci bezczynni |
+| czerwone | zielony deszcz znaków | przynajmniej jeden pracuje |
+| pomarańczowe (pulsuje) | pomarańczowy `?` | ktoś czeka na Twoją odpowiedź; ma pierwszeństwo przed czerwonym |
+| niebieskie (ładowanie) | niebieski skaner | agent kompaktuje kontekst rozmowy (`/compact` albo automatycznie) |
+| magentowe migotanie | magentowy glitch `ERR` | tura skończyła się błędem API albo sesja „pracuje” bez żadnych zdarzeń (zawieszona) |
+| wygaszony, szary | szary szum | brak jakiejkolwiek sesji – agent nie działa albo hooki nie są zainstalowane |
 
-Małe kropki pod sygnalizatorem to poszczególne sesje. Szara kropka oznacza sesję zawieszoną
-(pracuje, ale od dłuższego czasu nie przyszło żadne zdarzenie).
+W układzie Matrix każda sesja ma własny kafelek. W pozostałych układach sesje to małe kropki pod widgetem;
+szara kropka oznacza sesję zawieszoną (pracuje, ale od dłuższego czasu nie przyszło żadne zdarzenie).
 
 ## Jak to działa
 
@@ -32,8 +34,8 @@ Claude Code ──hook──▶ hook.py ──zapis──▶ %LOCALAPPDATA%\ai-t
 Wymagania: Windows 10/11, Python 3.10+ (`python` w PATH).
 
 ```bat
-git clone https://github.com/noxxren/ai_traffic_light.git
-cd ai_traffic_light
+git clone https://github.com/noxxren/AI_STATUS_WIDGET.git
+cd AI_STATUS_WIDGET
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
@@ -45,7 +47,7 @@ python -m venv .venv
 2. Widget: `start.bat`.
 3. Hooki łapią się w **nowo uruchomionych** sesjach Claude Code.
 
-Prawy klik na sygnalizatorze: przejście do czekającego agenta, lista sesji (kliknięcie przełącza do terminala),
+Prawy klik na widgecie: przejście do czekającego agenta, lista sesji (kliknięcie przełącza do terminala),
 tryb warstwy, **Nie przeszkadzać**, **Ustawienia…**, Zamknij.
 Lewy przycisk: przeciąganie. Kliknięcie w kropkę sesji przełącza do jej terminala, a kliknięcie w kapsułę –
 do najdłużej czekającego agenta. W trybie „pod oknami” kliknięcie chowa też widget pod okna.
@@ -108,9 +110,11 @@ Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakła
   (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa (ciemna / jasna / szklana / automatyczna według jasności tła),
   obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ, kropki sesji.
-  Układy: sygnalizator pionowy / poziomy, jedno światło zmieniające kolor, **Matrix** (kwadratowy ekran na każdą sesję – siatka rośnie: 1, 2×1, 2×2, 3×2…; kursor `>_`,
-  deszcz znaków przy pracy, glitchujący `?`, gdy ktoś czeka, przy kompaktowaniu niebieski skaner
-  jak KITT z „Knight Ridera”; własna paleta: praca w butelkowej zieleni, bezczynność biało-turkusowa;
-  kliknięcie w kafelek przełącza do jego terminala, przy krawędzi ekranu widget rośnie w stronę środka)
-  i **korektor** (słupki: nieruchome, tańczące przy pracy, podskakujące razem, gdy ktoś czeka).
+  Układy:
+  - **Matrix** (domyślny) – kwadratowy ekran na każdą sesję; siatka rośnie jak tekst w książce: 1, 2×1, 2×2, 3×2…
+    Kursor `>_` przy bezczynności, deszcz znaków przy pracy, glitchujący `?`, gdy ktoś czeka, niebieski skaner
+    jak KITT z „Knight Ridera” przy kompaktowaniu. Własna paleta: praca w butelkowej zieleni, bezczynność
+    biało-turkusowa. Kliknięcie w kafelek przełącza do jego terminala, przy krawędzi ekranu widget rośnie w stronę środka.
+  - sygnalizator pionowy / poziomy, jedno światło zmieniające kolor,
+  - **korektor** (słupki: nieruchome, tańczące przy pracy, podskakujące razem, gdy ktoś czeka).
 - **System** – autostart z Windows, instalacja/usunięcie hooków, folder stanu.

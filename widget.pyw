@@ -1,4 +1,4 @@
-"""Sygnalizator AI: minimalistyczny widget pokazujący stan agentów AI.
+"""AI Status Widget: minimalistyczny widget pokazujący stan agentów AI.
 
 Zielone   - wszyscy agenci bezczynni
 Czerwone  - przynajmniej jeden pracuje
@@ -51,7 +51,7 @@ LAMP_COLOR = {WORKING: RED, WAITING: AMBER, IDLE: GREEN, ERROR: GLITCH, OFFLINE:
 DOT_COLOR = {WORKING: QColor(217, 58, 43), WAITING: QColor(238, 143, 18), IDLE: QColor(31, 164, 99), STALE: GREY,
              ERROR: QColor(190, 60, 230), COMPACTING: QColor(46, 128, 230)}
 # układ Matrix: praca w przygaszonej, butelkowej zieleni „Matrixa”, bezczynność jako zimny, biało-turkusowy
-# terminal; pozostałe stany mają te same kolory co w sygnalizatorze
+# terminal; pozostałe stany mają te same kolory co w układzie sygnalizatora
 MATRIX_COLOR = {WORKING: QColor(27, 196, 106), IDLE: QColor(159, 232, 224)}
 
 DEFAULTS = {
@@ -62,7 +62,7 @@ DEFAULTS = {
     "stale_minutes": 10,
     "forget_hours": 12,
     "hotkey": "",             # przejdź do czekającego agenta; "" = wyłączony
-    "click_jumps": True,      # kliknięcie w sygnalizator przełącza do czekającego terminala
+    "click_jumps": True,      # kliknięcie w widget przełącza do czekającego terminala
     "question_waiting": True,  # odpowiedź zakończona pytaniem = czeka na Ciebie (pomarańczowe)
     # nie przeszkadzać
     "dnd_manual": False,
@@ -80,7 +80,7 @@ DEFAULTS = {
     "sound_idle": "Windows Notify Calendar.wav",
     # wygląd
     "scale": 1.25,
-    "orientation": "vertical",
+    "orientation": "matrix",
     "opacity": 0.85,
     "housing": "dark",        # "dark" | "light" | "glass" | "auto"
     "state_rim": True,        # obwódka i poświata w kolorze stanu
@@ -342,7 +342,7 @@ class Light(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_AlwaysShowToolTips)
-        self.setWindowTitle("Sygnalizator AI")
+        self.setWindowTitle("AI Status Widget")
 
         self.cfg = cfg
         self.sessions = load_sessions(cfg)
@@ -482,7 +482,7 @@ class Light(QWidget):
         changed = new != self.state
         self.state = new
         self.setToolTip(self.tooltip_text())
-        self.tray.setToolTip("Sygnalizator AI: " + self.caption())
+        self.tray.setToolTip("AI Status Widget: " + self.caption())
         self.tray.setIcon(self.tray_icon())
 
         events = self.session_events(sessions, now, initial)
@@ -595,7 +595,7 @@ class Light(QWidget):
             self._pop_t0 = time.monotonic()  # sama animacja, bez zmiany warstwy
 
     def notify(self, events):
-        """Tylko dźwięki – bez dymków Windows; resztę mówi sam sygnalizator."""
+        """Tylko dźwięki – bez dymków Windows; resztę mówi sam widget."""
         if self.dnd_active():
             return
         kinds = {k for k, _ in events}
@@ -1148,7 +1148,7 @@ class Light(QWidget):
     # ---- menu
     def fill_menu(self, menu):
         menu.clear()
-        head = menu.addAction(f"Sygnalizator AI · {self.caption()}")
+        head = menu.addAction(f"AI Status Widget · {self.caption()}")
         head.setEnabled(False)
 
         target = self.attention_session()
@@ -1308,7 +1308,7 @@ class SoundPicker(QWidget):
 class SettingsDialog(QDialog):
     def __init__(self, cfg, on_preview=None):
         super().__init__(None, Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle("Sygnalizator AI — ustawienia")
+        self.setWindowTitle("AI Status Widget — ustawienia")
         self.setMinimumWidth(540)
         self._on_preview = on_preview
         self._loading = True
@@ -1331,7 +1331,7 @@ class SettingsDialog(QDialog):
         self.hotkey_lbl = QLabel()
         self.hotkey_lbl.setObjectName("hint")
         self.hotkey.keySequenceChanged.connect(self._check_hotkey)
-        self.click_jumps = QCheckBox("Kliknięcie w sygnalizator przełącza do czekającego terminala")
+        self.click_jumps = QCheckBox("Kliknięcie w widget przełącza do czekającego terminala")
         self.question_waiting = QCheckBox("Odpowiedź agenta zakończona pytaniem = czeka na Ciebie (pomarańczowe)")
 
         # --- Nie przeszkadzać (w zakładce Zachowanie)
@@ -1376,7 +1376,7 @@ class SettingsDialog(QDialog):
         self.orientation.addItem("Jedno światło (zmienia kolor)", "single")
         self.orientation.addItem("Matrix (kwadratowy ekran)", "matrix")
         self.orientation.addItem("Korektor (słupki)", "eq")
-        self.show_dots = QCheckBox("Pokazuj kropki sesji pod sygnalizatorem")
+        self.show_dots = QCheckBox("Pokazuj kropki sesji pod widgetem (poza układem Matrix)")
 
         # --- System
         self.autostart = QCheckBox("Uruchamiaj razem z Windows")
@@ -1444,7 +1444,7 @@ class SettingsDialog(QDialog):
             "Nie przeszkadzać",
             ("", self.dnd_fullscreen),
             ("", hours),
-        ], "W trybie „Nie przeszkadzać” sygnalizator nadal zmienia kolor, ale nie wyskakuje na wierzch, "
+        ], "W trybie „Nie przeszkadzać” widget nadal zmienia kolor, ale nie wyskakuje na wierzch, "
            "nie gra dźwięków. Można go też włączyć ręcznie w menu pod prawym przyciskiem."),
             "Zachowanie")
         tabs.addTab(self._page([
@@ -1473,7 +1473,7 @@ class SettingsDialog(QDialog):
             ("Rozmiar", self.scale),
             ("Układ", self.orientation),
             ("", self.show_dots),
-        ], "Zmiany widać od razu na sygnalizatorze, a Anuluj przywraca poprzedni wygląd. "
+        ], "Zmiany widać od razu na widgecie, a Anuluj przywraca poprzedni wygląd. "
            "Obudowa automatyczna co 1,5 s sprawdza jasność tła i wybiera jasną albo ciemną kapsułę."), "Wygląd")
         hk_w = QWidget()
         hk = QHBoxLayout(hk_w)

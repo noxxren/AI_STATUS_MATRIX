@@ -1,4 +1,4 @@
-"""Hook dla Sygnalizatora AI.
+"""Hook dla AI Status Widget.
 
 Wywoływany przez CLI agenta (Claude Code, Gemini CLI, Codex CLI) przy każdym zdarzeniu.
 Czyta JSON zdarzenia (stdin albo ostatni argument), wylicza stan sesji i zapisuje go do

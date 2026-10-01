@@ -1,4 +1,4 @@
-"""Cienka warstwa WinAPI (ctypes) dla Sygnalizatora AI.
+"""Cienka warstwa WinAPI (ctypes) dla AI Status Widget.
 
 Tylko biblioteka standardowa: moduł importuje zarówno widget, jak i hook.py
 (hook potrzebuje `find_agent_process` i `process_created`).

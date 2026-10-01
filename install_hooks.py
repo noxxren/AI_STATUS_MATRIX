@@ -1,4 +1,4 @@
-"""Dopisuje (albo usuwa) hooki Sygnalizatora AI w ~/.claude/settings.json.
+"""Dopisuje (albo usuwa) hooki AI Status Widget w ~/.claude/settings.json.
 
     python install_hooks.py              # instalacja (z kopią zapasową settings.json)
     python install_hooks.py --uninstall  # usunięcie tylko naszych wpisów
