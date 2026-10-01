@@ -38,8 +38,8 @@ Claude Code ──hook──▶ hook.py ──write──▶ %LOCALAPPDATA%\ai-t
 Requirements: Windows 10/11, Python 3.10+ (`python` on PATH).
 
 ```bat
-git clone https://github.com/noxxren/AI_STATUS_WIDGET.git
-cd AI_STATUS_WIDGET
+git clone https://github.com/noxxren/AI_STATUS_MATRIX.git
+cd AI_STATUS_MATRIX
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
