@@ -1,13 +1,15 @@
-"""AI Status Widget: minimalistyczny widget pokazujący stan agentów AI.
+"""AI Status Widget: minimalistyczny widget pokazujący stan agentów AI jako ekrany w stylu Matrix.
 
-Zielone   - wszyscy agenci bezczynni
-Czerwone  - przynajmniej jeden pracuje
-Pomarańcz - ktoś czeka na Twoją odpowiedź (ma pierwszeństwo)
+Każda sesja (terminal) ma własny kwadratowy kafelek:
+  bezczynny  - kursor `>_`            pracuje      - deszcz znaków
+  czeka      - pomarańczowy `?`       kompaktuje   - niebieski skaner (KITT)
+  błąd       - glitch `ERR`           brak sesji   - szary szum
 
 Stan sesji zapisuje hook.py do %LOCALAPPDATA%\\ai-traffic-light\\sessions\\*.json.
 Widget czyta te pliki, dodatkowo wykrywa przerwania (Esc) i zamknięte sesje,
 przełącza do terminala agenta i gra dźwięki (bez dymków Windows). Uruchamiaj przez pythonw.
 """
+import functools
 import json
 import math
 import os
@@ -16,9 +18,10 @@ import sys
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QEvent, QLockFile, QPoint, QPointF, QRectF, Qt, QTime, QTimer
+from PySide6.QtCore import QEvent, QLocale, QLockFile, QPoint, QPointF, QRectF, Qt, QTime, QTimer
 from PySide6.QtGui import (
-    QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient,
+    QAction, QActionGroup, QBrush, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
+    QRadialGradient,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
@@ -28,6 +31,7 @@ from PySide6.QtWidgets import (
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import hook  # noqa: E402
 import install_hooks  # noqa: E402
 import winapi  # noqa: E402
 
@@ -44,15 +48,11 @@ LABEL = {IDLE: "bezczynny", WORKING: "pracuje", WAITING: "czeka na Ciebie", STAL
          COMPACTING: "kompaktuje kontekst"}
 CLI_NAME = {"claude": "Claude Code", "gemini": "Gemini CLI", "codex": "Codex CLI"}
 
-RED, AMBER, GREEN, GREY = QColor(255, 75, 58), QColor(255, 162, 31), QColor(47, 210, 124), QColor(120, 128, 138)
 GLITCH = QColor(220, 70, 255)  # błąd tury / zawieszona sesja
-BLUE = QColor(64, 156, 255)  # kompaktowanie
-LAMP_COLOR = {WORKING: RED, WAITING: AMBER, IDLE: GREEN, ERROR: GLITCH, OFFLINE: GREY, COMPACTING: BLUE}
-DOT_COLOR = {WORKING: QColor(217, 58, 43), WAITING: QColor(238, 143, 18), IDLE: QColor(31, 164, 99), STALE: GREY,
-             ERROR: QColor(190, 60, 230), COMPACTING: QColor(46, 128, 230)}
-# układ Matrix: praca w przygaszonej, butelkowej zieleni „Matrixa”, bezczynność jako zimny, biało-turkusowy
-# terminal; pozostałe stany mają te same kolory co w układzie sygnalizatora
-MATRIX_COLOR = {WORKING: QColor(27, 196, 106), IDLE: QColor(159, 232, 224)}
+# praca w przygaszonej, butelkowej zieleni „Matrixa”, bezczynność jako zimny, biało-turkusowy terminal
+COLOR = {WORKING: QColor(27, 196, 106), IDLE: QColor(159, 232, 224), WAITING: QColor(255, 162, 31),
+         COMPACTING: QColor(64, 156, 255), ERROR: GLITCH, STALE: GLITCH, OFFLINE: QColor(120, 128, 138)}
+KNOWN_STATES = (IDLE, WORKING, WAITING, ERROR, COMPACTING)  # stany, które może zapisać hook
 
 DEFAULTS = {
     # zachowanie
@@ -80,34 +80,165 @@ DEFAULTS = {
     "sound_idle": "Windows Notify Calendar.wav",
     # wygląd
     "scale": 1.25,
-    "orientation": "matrix",
     "opacity": 0.85,
     "housing": "dark",        # "dark" | "light" | "glass" | "auto"
     "state_rim": True,        # obwódka i poświata w kolorze stanu
     "glow": 0.6,              # siła poświaty 0..1
-    "show_dots": True,
     # system
+    "language": "auto",       # "auto" | "pl" | "en"
     "autostart": False,
     "pos": None,
 }
 
-# obudowa: (tło rgb, bazowa alfa tła, obwódka rgba, zgaszona lampa rgba)
+# obudowa kafelka: (tło rgb, bazowa alfa tła, obwódka rgba)
 HOUSING = {
-    "dark":  ((16, 19, 23), 255, (255, 255, 255, 26), (255, 255, 255, 26)),
-    "light": ((246, 247, 249), 255, (0, 0, 0, 36), (20, 28, 36, 34)),
-    "glass": ((255, 255, 255), 70, (255, 255, 255, 150), (255, 255, 255, 72)),
+    "dark":  ((16, 19, 23), 255, (255, 255, 255, 26)),
+    "light": ((246, 247, 249), 255, (0, 0, 0, 36)),
+    "glass": ((255, 255, 255), 70, (255, 255, 255, 150)),
 }
+OBSOLETE_KEYS = ("orientation", "show_dots")  # ustawienia usuniętych układów (sygnalizator, korektor…)
 
 HOTKEY_ID = 0xA11
-
-# układy rysowane zamiast lamp; przy pracy animują się bez przerwy
-MOVING_LAYOUTS = ("matrix", "eq")
+RADIUS = 2  # zaokrąglenie kafelków
 
 
 def light_color(color, k):
     """Kolor rozjaśniony w stronę bieli (k = 0..1)."""
     return QColor.fromRgbF(color.redF() + (1 - color.redF()) * k, color.greenF() + (1 - color.greenF()) * k,
                            color.blueF() + (1 - color.blueF()) * k, color.alphaF())
+
+
+# ---------------------------------------------------------------- język
+# Teksty interfejsu pisane są po polsku; T() zwraca angielskie tłumaczenie, gdy wybrano angielski.
+EN = {
+    # stany i podpisy
+    "bezczynny": "idle",
+    "pracuje": "working",
+    "czeka na Ciebie": "waiting for you",
+    "zawieszona": "stalled",
+    "błąd": "error",
+    "kompaktuje kontekst": "compacting context",
+    "{n} czeka na Ciebie": "{n} waiting for you",
+    "{n} z błędem lub zawieszona": "{n} with error or stalled",
+    "{n} kompaktuje kontekst": "{n} compacting context",
+    "{n} pracuje": "{n} working",
+    "wszyscy wolni": "all idle",
+    "brak aktywnych sesji": "no active sessions",
+    "Brak aktywnych sesji": "No active sessions",
+    "Nie przeszkadzać: włączone": "Do not disturb: on",
+    # szczegóły zapisywane przez hook i widget
+    "przerwane przez użytkownika": "interrupted by user",
+    "kompaktowanie kontekstu": "compacting context",
+    "kompaktowanie kontekstu (auto)": "compacting context (auto)",
+    # menu
+    "Przejdź do czekającego agenta": "Go to waiting agent",
+    "Przejdź do ostatniej sesji": "Go to latest session",
+    "Sesje ({n})": "Sessions ({n})",
+    "Wyczyść listę sesji": "Clear session list",
+    "Zawsze na wierzchu": "Always on top",
+    "Pod oknami, wyskakuj przy zmianie": "Below windows, pop up on change",
+    "Nie przeszkadzać": "Do not disturb",
+    "Ustawienia…": "Settings…",
+    "Zamknij": "Quit",
+    # gotowe style
+    "Kolorowa obwódka (domyślny)": "Colored rim (default)",
+    "Ciemna, bez obwódki": "Dark, no rim",
+    "Jasna": "Light",
+    "Szklana": "Glass",
+    "Jasna z kolorową obwódką": "Light with colored rim",
+    "Automatyczny kontrast": "Automatic contrast",
+    "Automatyczny kontrast z obwódką": "Automatic contrast with rim",
+    # wybór dźwięku
+    "Brak": "None",
+    "Wybierz plik .wav…": "Choose .wav file…",
+    "Odtwórz": "Play",
+    "Wybierz dźwięk": "Choose sound",
+    "Dźwięki (*.wav)": "Sounds (*.wav)",
+    # ustawienia
+    "AI Status Widget — ustawienia": "AI Status Widget — settings",
+    "Pod oknami, wyskakuje przy zmianie": "Below windows, pops up on change",
+    "Przy każdej zmianie stanu": "On every state change",
+    "Tylko gdy ktoś czeka (pomarańczowe)": "Only when someone is waiting (orange)",
+    "do kliknięcia": "until clicked",
+    "Kliknięcie w widget przełącza do czekającego terminala": "Clicking the widget switches to the waiting terminal",
+    "Odpowiedź agenta zakończona pytaniem = czeka na Ciebie (pomarańczowe)":
+        "Agent reply ending with a question = waiting for you (orange)",
+    "Gdy aplikacja jest na pełnym ekranie (prezentacja, gra, wideo)":
+        "When an app is full screen (presentation, game, video)",
+    "W godzinach": "During hours",
+    "Zagraj dźwięk, gdy agent skończy długie zadanie": "Play a sound when the agent finishes a long task",
+    "Zagraj dźwięk, gdy sesja długo czeka na kolejne polecenie":
+        "Play a sound when a session waits long for the next prompt",
+    "Własny": "Custom",
+    "Ciemna": "Dark",
+    "Szklana (półprzezroczysta)": "Glass (translucent)",
+    "Automatyczna (dopasuj do tła)": "Automatic (match background)",
+    "Obwódka i poświata w kolorze aktualnego stanu": "Rim and glow in the current state's color",
+    "Automatycznie (język systemu)": "Automatic (system language)",
+    "Uruchamiaj razem z Windows": "Start with Windows",
+    "Otwórz folder stanu": "Open state folder",
+    "Warstwa": "Layer",
+    "Wyskakuj": "Pop up",
+    "Na wierzchu przez": "Stay on top for",
+    "Zawieszona sesja po": "Session stalled after",
+    "Skrót do agenta": "Agent shortcut",
+    "W trybie „Nie przeszkadzać” widget nadal zmienia kolor, ale nie wyskakuje na wierzch, "
+    "nie gra dźwięków. Można go też włączyć ręcznie w menu pod prawym przyciskiem.":
+        "In “Do not disturb” mode the widget still changes color, but it does not pop up "
+        "or play sounds. You can also turn it on manually from the right-click menu.",
+    "Zachowanie": "Behavior",
+    "Ktoś czeka na odpowiedź": "Someone is waiting for a reply",
+    "Dźwięk": "Sound",
+    "Koniec długiego zadania": "Long task finished",
+    "Zadanie trwające od": "Task lasting at least",
+    "Bezczynna sesja": "Idle session",
+    "Bezczynna od": "Idle for",
+    "Tylko dźwięki – widget nie pokazuje dymków Windows. Przycisk ▶ odtwarza wybrany dźwięk. "
+    "W trybie „Nie przeszkadzać” dźwięki są wyciszone.":
+        "Sounds only – the widget shows no Windows notifications. The ▶ button plays the selected sound. "
+        "Sounds are muted in “Do not disturb” mode.",
+    "Dźwięki": "Sounds",
+    "Gotowy styl": "Preset",
+    "Obudowa": "Housing",
+    "Siła poświaty": "Glow strength",
+    "Krycie tła": "Background opacity",
+    "Rozmiar": "Size",
+    "Zmiany widać od razu na widgecie, a Anuluj przywraca poprzedni wygląd. "
+    "Obudowa automatyczna co 1,5 s sprawdza jasność tła i wybiera jasne albo ciemne kafelki.":
+        "Changes show on the widget right away; Cancel restores the previous look. "
+        "Automatic housing checks the background brightness every 1.5 s and picks light or dark tiles.",
+    "Wygląd": "Appearance",
+    "Język / Language": "Language / Język",
+    "Hooki Claude Code": "Claude Code hooks",
+    "Hooki działają w sesjach Claude Code uruchomionych po instalacji. Zmiana języka działa po zapisaniu.":
+        "Hooks work in Claude Code sessions started after installation. Language changes apply after saving.",
+    "Zapisz": "Save",
+    "Anuluj": "Cancel",
+    "Wyłączony. Kliknij pole i naciśnij kombinację klawiszy.": "Off. Click the field and press a key combination.",
+    "Nieobsługiwany klawisz: użyj litery, cyfry, F1–F24 albo spacji z Ctrl/Alt/Shift/Win.":
+        "Unsupported key: use a letter, digit, F1–F24 or Space with Ctrl/Alt/Shift/Win.",
+    "Przełącza do najdłużej czekającego agenta, a gdy nikt nie czeka, do ostatniej sesji.":
+        "Switches to the agent waiting longest, or to the latest session when nobody is waiting.",
+    "zainstalowane": "installed",
+    "niezainstalowane": "not installed",
+    "Usuń": "Remove",
+    "Zainstaluj": "Install",
+}
+LANG = "pl"
+
+
+def T(text):
+    """Tekst interfejsu w wybranym języku (polski jest językiem źródłowym)."""
+    return EN.get(text, text) if LANG == "en" else text
+
+
+def set_language(cfg):
+    """"auto" = język systemu: polski dla polskiego Windows, w pozostałych przypadkach angielski."""
+    global LANG
+    lang = cfg.get("language", "auto")
+    if lang not in ("pl", "en"):
+        lang = "pl" if QLocale.system().language() == QLocale.Polish else "en"
+    LANG = lang
 
 
 # ---------------------------------------------------------------- config & sessions
@@ -121,9 +252,7 @@ def load_config():
     # migracja: stare pole "sound_on_waiting" (bool) -> "sound_waiting" (dźwięk)
     if stored.pop("sound_on_waiting", False) and "sound_waiting" not in stored:
         stored["sound_waiting"] = "Windows Exclamation.wav"
-    cfg.update(stored)
-    if cfg["orientation"] == "ring":  # pierścień zastąpiony ekranem Matrix
-        cfg["orientation"] = "matrix"
+    cfg.update({k: v for k, v in stored.items() if k not in OBSOLETE_KEYS})
     return cfg
 
 
@@ -149,17 +278,35 @@ def write_session(path, record):
     _remove(tmp)
 
 
+_parsed = {}  # ścieżka -> ((mtime_ns, rozmiar), rekord): plik czytamy ponownie tylko, gdy się zmienił
+
+
+def _read_session(entry):
+    st = entry.stat()
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _parsed.get(entry.path)
+    if cached and cached[0] == key:
+        return dict(cached[1])
+    with open(entry.path, encoding="utf-8") as f:
+        rec = json.load(f)
+    if not isinstance(rec, dict):
+        raise ValueError(entry.path)
+    _parsed[entry.path] = (key, rec)
+    return dict(rec)
+
+
 def load_sessions(cfg):
+    """Sesje posortowane od najstarszej – w tej kolejności („jak w książce”) stoją kafelki."""
     out, now = [], time.time()
     try:
-        names = os.listdir(SESSIONS_DIR)
+        entries = list(os.scandir(SESSIONS_DIR))
     except OSError:
         return out
-    for name in names:
-        path = os.path.join(SESSIONS_DIR, name)
+    for entry in entries:
+        name, path = entry.name, entry.path
         if name.endswith(".tmp"):
             try:
-                if now - os.path.getmtime(path) > 60:
+                if now - entry.stat().st_mtime > 60:
                     os.remove(path)  # osierocony plik po nieudanym zapisie
             except OSError:
                 pass
@@ -167,9 +314,10 @@ def load_sessions(cfg):
         if not name.endswith(".json"):
             continue
         try:
-            with open(path, encoding="utf-8") as f:
-                s = json.load(f)
+            s = _read_session(entry)
         except (OSError, ValueError):
+            continue
+        if s.get("state") not in KNOWN_STATES:
             continue
         age = now - float(s.get("ts", 0))
         if age > cfg["forget_hours"] * 3600:
@@ -183,7 +331,9 @@ def load_sessions(cfg):
             s["state"] = STALE
         s["_path"] = path
         out.append(s)
-    out.sort(key=lambda s: (s.get("project", ""), s.get("session_id", "")))
+    for gone in _parsed.keys() - {s["_path"] for s in out}:
+        del _parsed[gone]
+    out.sort(key=lambda s: (float(s.get("started") or s.get("ts") or 0), s.get("session_id", "")))
     return out
 
 
@@ -210,39 +360,22 @@ def aggregate(sessions):
     return IDLE
 
 
-def _text(content):
-    if isinstance(content, list):
-        return " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-    return str(content or "")
-
-
 def transcript_status(path, since_ts):
     """("interrupted", "") gdy tura przerwana klawiszem Esc, ("error", tekst) gdy skończyła się błędem API,
     inaczej (None, "")."""
     try:
-        st = os.stat(path)
-        if st.st_mtime < since_ts - 1:
+        if os.stat(path).st_mtime < since_ts - 1:
             return None, ""  # od ostatniego zdarzenia nic nie dopisano
-        with open(path, "rb") as f:
-            f.seek(max(0, st.st_size - 65536))
-            lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return None, ""
-    for line in reversed(lines):
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
+    for obj in hook.tail_entries(path):
         kind = obj.get("type")
         if kind == "assistant":
-            if obj.get("isApiErrorMessage"):
-                return "error", _text((obj.get("message") or {}).get("content")).strip() or "API Error"
-            return None, ""
-        if kind != "user":
-            continue
-        if "[Request interrupted by user" in _text((obj.get("message") or {}).get("content")):
-            return "interrupted", ""
-        return None, ""
+            error = hook.error_text(obj)
+            return ("error", error) if error else (None, "")
+        if kind == "user":
+            interrupted = "[Request interrupted by user" in hook._text_of((obj.get("message") or {}).get("content"))
+            return ("interrupted", "") if interrupted else (None, "")
     return None, ""
 
 
@@ -355,9 +488,11 @@ class Light(QWidget):
         self._reminded = set()       # (session_id, since) – przypomnienia o bezczynności już wysłane
         self._last_deep_check = 0.0
         self._hotkey_on = False
+        self._icon_key = None        # (stan, nie przeszkadzać) narysowane na ikonie w zasobniku
+        self._look = None            # [(session_id, stan)] z ostatniego przerysowania
 
         self.poll = QTimer(self, interval=300, timeout=self.refresh)
-        self.anim = QTimer(self, interval=33, timeout=self._tick)
+        self.anim = QTimer(self, timeout=self._tick)
         self.unpop = QTimer(self, singleShot=True, timeout=self.send_back)
         self.auto_housing = "dark"
         self.bg_probe = QTimer(self, interval=1500, timeout=self.probe_background)
@@ -375,63 +510,34 @@ class Light(QWidget):
         self.poll.start()
         self.apply_appearance()
 
-    # ---- kolory
-    def color(self, state):
-        """Kolor stanu dla bieżącego układu (Matrix ma własną paletę dla pracy i bezczynności)."""
-        if self.cfg["orientation"] == "matrix" and state in MATRIX_COLOR:
-            return MATRIX_COLOR[state]
-        return LAMP_COLOR[state]
-
-    def dot_color(self, state):
-        if self.cfg["orientation"] == "matrix" and state in MATRIX_COLOR:
-            return MATRIX_COLOR[state]
-        return DOT_COLOR.get(state, GREY)
-
     # ---- geometry
     def dims(self):
+        """Siatka kafelków: jeden na sesję, rośnie 1, 2×1, 2×2, 3×2, 3×3…"""
         s = self.cfg["scale"]
-        d, gap, pad, margin = 14 * s, 6 * s, 7 * s, 16 * s
-        long_side, short_side = 3 * d + 2 * gap + 2 * pad, d + 2 * pad
-        layout = self.cfg["orientation"]
-        tile, tgap, cols, rows = 20 * s + 2 * pad, 3 * s, 1, 1
-        if layout == "matrix":  # kafelek na sesję, siatka rośnie: 1, 2×1, 2×2, 3×2, 3×3…
-            n = max(1, len(self.sessions))
-            cols = math.ceil(math.sqrt(n))
-            rows = math.ceil(n / cols)
-            cw, ch = cols * tile + (cols - 1) * tgap, rows * tile + (rows - 1) * tgap
-        elif layout == "single":
-            cw = ch = tile  # okrągła obudowa
-        elif layout == "eq":
-            cw, ch = 29 * s + 2 * pad, 20 * s + 2 * pad
-        elif layout == "vertical":
-            cw, ch = short_side, long_side
-        else:
-            cw, ch = long_side, short_side
-        dot, dgap, dtop = 4 * s, 3 * s, 5 * s
-        # w układzie Matrix każda sesja ma własny kafelek, więc kropki są zbędne
-        n = len(self.sessions) if self.cfg["show_dots"] and layout != "matrix" else 0
-        dots_w = n * dot + max(n - 1, 0) * dgap
-        return dict(s=s, d=d, gap=gap, pad=pad, m=margin, cw=cw, ch=ch, dot=dot, dgap=dgap, dtop=dtop, n=n,
-                    dots_w=dots_w, tile=tile, tgap=tgap, cols=cols, rows=rows)
+        tile, gap, margin = 34 * s, 3 * s, 16 * s
+        n = max(1, len(self.sessions))
+        cols = math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+        return dict(s=s, m=margin, tile=tile, gap=gap, cols=cols,
+                    cw=cols * tile + (cols - 1) * gap, ch=rows * tile + (rows - 1) * gap)
 
-    def matrix_tiles(self, g=None):
-        """[(prostokąt, sesja albo None)] kafelków Matrix w kolejności „jak w książce”: od najstarszej sesji,
-        od lewej do prawej, potem kolejny rząd – nowy terminal zawsze dostaje następne wolne miejsce."""
+    def tiles(self, g=None):
+        """[(prostokąt, sesja albo None)] w kolejności „jak w książce”: od najstarszej sesji, od lewej do prawej,
+        potem kolejny rząd – nowy terminal zawsze dostaje następne wolne miejsce. Bez sesji jeden pusty kafelek."""
         g = g or self.dims()
-        body = self.body_rect(g)
-        sessions = sorted(self.sessions, key=lambda s: (float(s.get("started") or s.get("ts") or 0),
-                                                       s.get("session_id", ""))) or [None]
-        step = g["tile"] + g["tgap"]
+        step = g["tile"] + g["gap"]
         out = []
-        for i, sess in enumerate(sessions):
+        for i, sess in enumerate(self.sessions or [None]):
             row, col = divmod(i, g["cols"])
-            out.append((QRectF(body.left() + col * step, body.top() + row * step, g["tile"], g["tile"]), sess))
+            out.append((QRectF(g["m"] + col * step, g["m"] + row * step, g["tile"], g["tile"]), sess))
         return out
+
+    def tile_at(self, pos):
+        return next((sess for rect, sess in self.tiles() if sess and rect.contains(pos)), None)
 
     def relayout(self):
         g = self.dims()
-        w = math.ceil(max(g["cw"], g["dots_w"]) + 2 * g["m"])
-        h = math.ceil(g["ch"] + (g["dtop"] + g["dot"] if g["n"] else 0) + 2 * g["m"])
+        w, h = math.ceil(g["cw"] + 2 * g["m"]), math.ceil(g["ch"] + 2 * g["m"])
         old = self.geometry()
         self.setFixedSize(w, h)
         screen = self.screen()
@@ -448,15 +554,7 @@ class Light(QWidget):
 
     def body_rect(self, g=None):
         g = g or self.dims()
-        return QRectF(self.width() / 2 - g["cw"] / 2, g["m"], g["cw"], g["ch"])
-
-    def dot_centers(self, g=None):
-        g = g or self.dims()
-        if not g["n"]:
-            return []
-        y = self.body_rect(g).bottom() + g["dtop"] + g["dot"] / 2
-        x0 = self.width() / 2 - g["dots_w"] / 2 + g["dot"] / 2
-        return [QPointF(x0 + i * (g["dot"] + g["dgap"]), y) for i in range(g["n"])]
+        return QRectF(g["m"], g["m"], g["cw"], g["ch"])
 
     def restore_pos(self):
         pos = self.cfg.get("pos")
@@ -475,7 +573,7 @@ class Light(QWidget):
             self._last_deep_check = now
             sessions = self.deep_check(sessions, now)
         self.sessions = sessions
-        if len(sessions) != prev_n and (self.cfg["show_dots"] or self.cfg["orientation"] == "matrix"):
+        if len(sessions) != prev_n:
             self.relayout()
 
         new = aggregate(sessions)
@@ -483,15 +581,21 @@ class Light(QWidget):
         self.state = new
         self.setToolTip(self.tooltip_text())
         self.tray.setToolTip("AI Status Widget: " + self.caption())
-        self.tray.setIcon(self.tray_icon())
+        icon_key = (new, self.cfg["dnd_manual"])
+        if icon_key != self._icon_key:  # podmiana ikony w zasobniku jest kosztowna – tylko przy zmianie
+            self._icon_key = icon_key
+            self.tray.setIcon(self.tray_icon())
 
         events = self.session_events(sessions, now, initial)
         if changed and not initial:
             self.on_change(new)
         if events and not initial:
             self.notify(events)
+        look = [(s.get("session_id"), s["state"]) for s in sessions]
+        if look != self._look:  # bez animacji przerysuj tylko, gdy coś się zmieniło
+            self._look = look
+            self.update()
         self._sync_anim()
-        self.update()
 
     def deep_check(self, sessions, now):
         """Co ~2 s: usuń sesje zamkniętych procesów, wykryj przerwanie klawiszem Esc i turę zakończoną błędem API
@@ -540,6 +644,7 @@ class Light(QWidget):
                     if not initial:
                         events.append(("idle", s))
         self._prev = {s.get("session_id"): s.get("state") for s in sessions}
+        self._reminded = {key for key in self._reminded if key[0] in self._prev}  # bez zamkniętych sesji
         return events
 
     def caption(self):
@@ -548,35 +653,33 @@ class Light(QWidget):
         n_work = sum(s["state"] == WORKING for s in self.sessions)
         n_compact = sum(s["state"] == COMPACTING for s in self.sessions)
         if n_wait:
-            return f"{n_wait} czeka na Ciebie"
+            return T("{n} czeka na Ciebie").format(n=n_wait)
         if n_err:
-            return f"{n_err} z błędem lub zawieszona"
+            return T("{n} z błędem lub zawieszona").format(n=n_err)
         if n_compact:
-            return f"{n_compact} kompaktuje kontekst"
+            return T("{n} kompaktuje kontekst").format(n=n_compact)
         if n_work:
-            return f"{n_work} pracuje"
-        return "wszyscy wolni" if self.sessions else "brak aktywnych sesji"
+            return T("{n} pracuje").format(n=n_work)
+        return T("wszyscy wolni") if self.sessions else T("brak aktywnych sesji")
 
     def session_line(self, s):
         cli = CLI_NAME.get(s.get("cli"), s.get("cli", ""))
-        line = f"{s.get('project', '?')} · {cli} — {LABEL[s['state']]}"
+        line = f"{s.get('project', '?')} · {cli} — {T(LABEL[s['state']])}"
         if s.get("since") and s["state"] != STALE:
             line += f" {fmt_duration(time.time() - float(s['since']))}"
         return line
 
+    def session_text(self, s):
+        """Linia sesji, a pod nią szczegół (narzędzie, pytanie, błąd), gdy sesja nie jest bezczynna."""
+        line = self.session_line(s)
+        if s["state"] != IDLE and s.get("detail"):
+            line += f"\n    {T(s['detail'])}"
+        return line
+
     def tooltip_text(self):
-        if not self.sessions:
-            text = "Brak aktywnych sesji"
-        else:
-            lines = []
-            for s in self.sessions:
-                line = self.session_line(s)
-                if s["state"] in (WORKING, WAITING, ERROR, COMPACTING) and s.get("detail"):
-                    line += f"\n    {s['detail']}"
-                lines.append(line)
-            text = "\n".join(lines)
+        text = "\n".join(map(self.session_text, self.sessions)) or T("Brak aktywnych sesji")
         if self.dnd_active():
-            text += "\n\nNie przeszkadzać: włączone"
+            text += "\n\n" + T("Nie przeszkadzać: włączone")
         return text
 
     # ---- nie przeszkadzać & powiadomienia
@@ -716,24 +819,18 @@ class Light(QWidget):
             self.update()
 
     # ---- animation
-    def _animating(self):
-        layout = self.cfg["orientation"]
-        moving = layout in MOVING_LAYOUTS and self.state == WORKING
-        noise = layout == "matrix" and self.state == OFFLINE  # szum na wygaszonym ekranie
-        return (moving or noise or self.state in (WAITING, ERROR, COMPACTING)
-                or time.monotonic() - self._pop_t0 < 1.2)
-
     @staticmethod
     def _rng(now, salt=0, fps=14):
         """Generator losowy stały w obrębie jednej klatki glitcha (zmienia się fps razy na sekundę)."""
         return random.Random(int(now * fps) * 7919 + salt)
 
     def _sync_anim(self):
-        if self._animating():
-            if not self.anim.isActive():
-                self.anim.start()
-        else:
-            self.anim.stop()
+        """Pełna płynność (30 kl./s), gdy cokolwiek się rusza; same bezczynne kafelki potrzebują tylko
+        mrugającego kursora, więc wystarczają 4 klatki na sekundę."""
+        fast = self.state != IDLE or time.monotonic() - self._pop_t0 < 1.2
+        interval = 33 if fast else 250
+        if self.anim.interval() != interval or not self.anim.isActive():
+            self.anim.start(interval)
 
     def _tick(self):
         self.update()
@@ -742,13 +839,12 @@ class Light(QWidget):
     # ---- painting
     def paintEvent(self, _):
         g = self.dims()
+        tiles = [(rect, self.tile_state(sess)) for rect, sess in self.tiles(g)]
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         now = time.monotonic()
         t = now - self._pop_t0
-
         body = self.body_rect(g)
-        radius = 2 if self.cfg["orientation"] == "matrix" else min(g["cw"], g["ch"]) / 2
 
         # animacja "pop": sprężyste powiększenie
         if 0 <= t < 0.5:
@@ -759,112 +855,111 @@ class Light(QWidget):
             p.translate(-body.center())
 
         # błąd / zawieszenie: co jakiś czas cały widget drga w bok
-        glitch = self.state == ERROR and self._rng(now).random() < 0.3
-        if glitch:
+        if self.state == ERROR and self._rng(now).random() < 0.3:
             p.translate(self._rng(now, 1).uniform(-2, 2) * g["s"], 0)
 
         breathe = 0.72 + 0.28 * math.cos(now * math.tau / 1.6)
-        pulse = self._pulse(self.state, now, breathe)
-        state_col = self.color(self.state)
         rim = self.cfg["state_rim"]
-        # bryły z cieniem i poświatą: cała obudowa albo (Matrix) każdy kafelek w kolorze swojej sesji
-        if self.cfg["orientation"] == "matrix":
-            shapes = [(rect, self.color(self.tile_state(sess)), self._pulse(self.tile_state(sess), now, breathe))
-                      for rect, sess in self.matrix_tiles(g)]
-        else:
-            shapes = [(body, state_col, pulse)]
+        bg_rgb, bg_alpha, border = HOUSING[self.housing()]
+        bg = QColor(*bg_rgb, int(bg_alpha * self.cfg["opacity"]))
 
         # cień
-        for shape, _, _ in shapes:
+        p.setPen(Qt.NoPen)
+        for rect, _ in tiles:
             for i, a in enumerate((18, 12, 7)):
-                sh = shape.adjusted(-i - 1, -i + 2, i + 1, i + 4)
-                path = QPainterPath()
-                path.addRoundedRect(sh, radius + i, radius + i)
-                p.fillPath(path, QColor(0, 0, 0, a))
+                p.setBrush(QColor(0, 0, 0, a))
+                p.drawRoundedRect(rect.adjusted(-i - 1, -i + 2, i + 1, i + 4), RADIUS + i, RADIUS + i)
 
-        # poświata dookoła obudowy w kolorze stanu
+        # poświata dookoła każdego kafelka w kolorze jego stanu
+        pulses = [self._pulse(st, now, breathe) for _, st in tiles]
         if rim and self.cfg["glow"] > 0:
             layers = 7
-            for shape, color, shape_pulse in shapes:
+            for (rect, st), pulse in zip(tiles, pulses):
+                c = QColor(COLOR[st])
                 for i in range(layers, 0, -1):
                     grow = i * 2 * g["s"]
-                    c = QColor(color)
-                    c.setAlphaF(min(1.0, 0.16 * self.cfg["glow"] * shape_pulse * (1 - (i - 1) / layers)))
-                    halo = QPainterPath()
-                    halo.addRoundedRect(shape.adjusted(-grow, -grow, grow, grow), radius + grow, radius + grow)
-                    p.fillPath(halo, c)
+                    c.setAlphaF(min(1.0, 0.16 * self.cfg["glow"] * pulse * (1 - (i - 1) / layers)))
+                    p.setBrush(c)
+                    p.drawRoundedRect(rect.adjusted(-grow, -grow, grow, grow), RADIUS + grow, RADIUS + grow)
 
-        # obudowa (Matrix: każdy kafelek ma własną, w kolorze swojej sesji)
-        bg_rgb, bg_alpha, border, lamp_off = HOUSING[self.housing()]
-        layout = self.cfg["orientation"]
-        if layout == "matrix":
-            self._paint_matrix_grid(p, g, now, breathe, bg_rgb, bg_alpha, border, rim)
-        else:
-            path = QPainterPath()
-            path.addRoundedRect(body, radius, radius)
-            p.fillPath(path, QColor(*bg_rgb, int(bg_alpha * self.cfg["opacity"])))
+        # kafelki: obudowa z obwódką w kolorze stanu i ekran Matrix
+        for (rect, st), pulse in zip(tiles, pulses):
             if rim:
-                c = QColor(state_col)
+                c = QColor(COLOR[st])
                 c.setAlphaF(0.55 + 0.35 * pulse)
                 p.setPen(QPen(c, 1.5 * g["s"]))
             else:
                 p.setPen(QPen(QColor(*border), 1))
-            p.drawPath(path)
+            p.setBrush(bg)
+            p.drawRoundedRect(rect, RADIUS, RADIUS)
+            self._paint_screen(p, rect, g["s"], now, breathe, st)
 
         # poświata przy wyskoczeniu
         if 0 <= t < 1.2:
             k = t / 1.2
             grow = 12 * g["s"] * k
-            ring = QPainterPath()
-            ring.addRoundedRect(body.adjusted(-grow, -grow, grow, grow), radius + grow, radius + grow)
+            p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor(255, 255, 255, int(150 * (1 - k))), 2 * g["s"]))
-            p.drawPath(ring)
-
-        if layout == "eq":
-            self._paint_eq(p, body, g, now, lamp_off)
-
-        # lampy
-        single = layout == "single"
-        lamps = () if layout in MOVING_LAYOUTS else (self.state,) if single else (WORKING, WAITING, IDLE)
-        for i, st in enumerate(lamps):
-            off = g["pad"] + i * (g["d"] + g["gap"]) + g["d"] / 2
-            if single:
-                c = body.center()
-            elif self.cfg["orientation"] == "vertical":
-                c = QPointF(body.center().x(), body.top() + off)
-            else:
-                c = QPointF(body.left() + off, body.center().y())
-            r = g["d"] / 2
-            p.setPen(Qt.NoPen)
-            if self.state == ERROR:  # lampy migają chaotycznie w kolorze glitcha
-                lit, col = self._rng(now, 10 + i).random() < 0.45, QColor(GLITCH)
-            elif self.state == COMPACTING:  # ładowanie: niebieskie światło przeskakuje po kolei
-                lit, col = single or int(now * 8) % len(lamps) == i, QColor(BLUE)
-            else:  # offline: wszystkie zgaszone
-                lit, col = st == self.state and st != OFFLINE, QColor(LAMP_COLOR[st])
-            if lit:
-                alpha = breathe if st == WAITING or (single and self.state == COMPACTING) else 1.0
-                glow = QRadialGradient(c, r * 2.3)
-                gc = QColor(col)
-                gc.setAlphaF(0.55 * alpha)
-                glow.setColorAt(0.35, gc)
-                gc.setAlphaF(0)
-                glow.setColorAt(1, gc)
-                p.setBrush(glow)
-                p.drawEllipse(c, r * 2.3, r * 2.3)
-                col.setAlphaF(0.55 + 0.45 * alpha)
-                p.setBrush(col)
-            else:
-                p.setBrush(QColor(*lamp_off))
-            p.drawEllipse(c, r, r)
-
-        # kropki sesji
-        for s, c in zip(self.sessions, self.dot_centers(g)):
-            p.setBrush(self.dot_color(s["state"]))
-            p.drawEllipse(c, g["dot"] / 2, g["dot"] / 2)
+            p.drawRoundedRect(body.adjusted(-grow, -grow, grow, grow), RADIUS + grow, RADIUS + grow)
         p.end()
 
-    def _center_glow(self, p, c, r, color, alpha):
+    def _pulse(self, st, now, breathe):
+        """Jasność obwódki i poświaty: pulsuje przy czekaniu, migocze przy błędzie, przygaszona bez sesji."""
+        if st == WAITING:
+            return breathe
+        if st == OFFLINE:
+            return 0.25
+        if st == ERROR:
+            return 0.4 + 0.6 * self._rng(now, 2).random()
+        return 1.0
+
+    @staticmethod
+    def tile_state(sess):
+        if sess is None:
+            return OFFLINE
+        return ERROR if sess["state"] == STALE else sess["state"]
+
+    def _paint_screen(self, p, tile, s, now, breathe, st):
+        """Ekran kafelka: kursor `>_` (bezczynny), deszcz znaków (pracuje), glitchujący `?` (czeka),
+        skaner KITT (kompaktuje), zakłócony obraz z `ERR` (błąd albo zawieszona sesja), szum (brak sesji)."""
+        col = COLOR[st]
+        screen = tile.adjusted(2 * s, 2 * s, -2 * s, -2 * s)
+        p.save()
+        clip = QPainterPath()
+        clip.addRoundedRect(screen, RADIUS, RADIUS)
+        p.setClipPath(clip)
+        if st == OFFLINE:
+            self._paint_noise(p, screen, s, now)
+        else:
+            self._center_glow(p, screen.center(), screen.width() * 0.7, col, 0.22 * (breathe if st == WAITING else 1.0))
+        if st == ERROR:
+            self._paint_error(p, screen, s, now)
+        elif st == COMPACTING:
+            self._paint_compacting(p, screen, s, now, col)
+        elif st == WORKING:
+            self._paint_rain(p, screen, s, now, col)
+        elif st == WAITING:
+            glitch = (now * 2.3) % 1 < 0.12  # na moment rozszczepienie na cyjan i magentę
+            self._paint_glyph(p, screen, s, "?", col, 11 * s, Qt.AlignCenter, glitch)
+        elif st == IDLE:  # znak zachęty w lewym dolnym rogu, jak w terminalu
+            prompt = screen.adjusted(2.5 * s, 2 * s, -2 * s, -1.5 * s)
+            self._paint_glyph(p, prompt, s, ">_" if int(now * 2) % 2 else ">", col, 7 * s, Qt.AlignLeft | Qt.AlignBottom)
+        p.fillRect(screen, self._scanlines(s))  # linie skanowania jak na monitorze kineskopowym
+        p.restore()
+
+    @staticmethod
+    @functools.lru_cache(maxsize=8)
+    def _scanlines(s):
+        """Pędzel z wzorem linii skanowania (rysowany raz na skalę zamiast pętli w każdej klatce)."""
+        step = max(2, round(1.8 * s))
+        img = QImage(1, step, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        for y in range(max(1, round(0.6 * s))):
+            img.setPixelColor(0, y, QColor(0, 0, 0, 60))
+        return QBrush(img)
+
+    @staticmethod
+    def _center_glow(p, c, r, color, alpha):
         grad = QRadialGradient(c, r)
         gc = QColor(color)
         gc.setAlphaF(alpha)
@@ -875,82 +970,26 @@ class Light(QWidget):
         p.setBrush(grad)
         p.drawEllipse(c, r, r)
 
-    def _pulse(self, st, now, breathe):
-        """Jasność obwódki i poświaty: pulsuje przy czekaniu, migocze przy błędzie, przygaszona bez sesji."""
-        return {WAITING: breathe, OFFLINE: 0.25, ERROR: 0.4 + 0.6 * self._rng(now, 2).random()}.get(st, 1.0)
-
-    @staticmethod
-    def tile_state(sess):
-        if sess is None:
-            return OFFLINE
-        return ERROR if sess["state"] == STALE else sess["state"]
-
-    def _paint_matrix_grid(self, p, g, now, breathe, bg_rgb, bg_alpha, border, rim):
-        """Kafelek na sesję: obudowa z obwódką w kolorze stanu tej sesji i jej własny ekran Matrix."""
-        for rect, sess in self.matrix_tiles(g):
-            st = self.tile_state(sess)
-            pulse = self._pulse(st, now, breathe)
-            path = QPainterPath()
-            path.addRoundedRect(rect, 2, 2)
-            p.fillPath(path, QColor(*bg_rgb, int(bg_alpha * self.cfg["opacity"])))
-            if rim:
-                c = QColor(self.color(st))
-                c.setAlphaF(0.55 + 0.35 * pulse)
-                p.setPen(QPen(c, 1.5 * g["s"]))
-            else:
-                p.setPen(QPen(QColor(*border), 1))
-            p.drawPath(path)
-            self._paint_matrix(p, rect, g, now, breathe, st)
-
-    def _paint_matrix(self, p, body, g, now, breathe, st):
-        """Ekran w stylu Matrix: kursor `>_` (bezczynny), deszcz znaków (pracuje), glitchujący `?` (czeka),
-        wygaszony ekran z szumem (brak sesji), zakłócony obraz z `ERR` (błąd tury albo zawieszona sesja)."""
-        s = g["s"]
-        col = QColor(self.color(st))
-        screen = body.adjusted(2 * s, 2 * s, -2 * s, -2 * s)
-        p.save()
-        clip = QPainterPath()
-        clip.addRoundedRect(screen, 2, 2)
-        p.setClipPath(clip)
-        if st != OFFLINE:
-            self._center_glow(p, screen.center(), screen.width() * 0.7, col, 0.22 * (breathe if st == WAITING else 1.0))
-        if st == OFFLINE:
-            self._paint_noise(p, screen, s, now)
-        elif st == ERROR:
-            self._paint_error(p, screen, s, now)
-        elif st == COMPACTING:
-            self._paint_compacting(p, screen, s, now, col)
-        elif st == WORKING:
-            self._paint_rain(p, screen, s, now, col)
-        elif st == WAITING:
-            glitch = (now * 2.3) % 1 < 0.12  # na moment rozszczepienie na cyjan i magentę
-            self._paint_glyph(p, screen, s, "?", col, 11 * s, Qt.AlignCenter, glitch)
-        else:  # znak zachęty w lewym dolnym rogu, jak w terminalu
-            prompt = screen.adjusted(2.5 * s, 2 * s, -2 * s, -1.5 * s)
-            self._paint_glyph(p, prompt, s, ">_" if int(now * 2) % 2 else ">", col, 7 * s, Qt.AlignLeft | Qt.AlignBottom)
-        scan = QColor(0, 0, 0, 60)  # linie skanowania jak na monitorze kineskopowym
-        y = screen.top()
-        while y < screen.bottom():
-            p.fillRect(QRectF(screen.left(), y, screen.width(), 0.6 * s), scan)
-            y += 1.8 * s
-        p.restore()
-
     def _paint_noise(self, p, rect, s, now):
-        """Szum jak na wyłączonym telewizorze: szare ziarno i wolno przesuwający się jaśniejszy pas."""
+        """Szum jak na wyłączonym telewizorze: szare ziarno i wolno przesuwający się jaśniejszy pas.
+        Ziarno to mały obrazek (piksel = ziarno) rozciągnięty na ekran – jedno rysowanie zamiast setek."""
         rnd = self._rng(now, fps=12)
         cell = 1.5 * s
-        band = rect.top() + (now * 0.35 % 1) * rect.height()
-        y = rect.top()
-        while y < rect.bottom():
-            near = max(0.0, 1 - abs(y - band) / (5 * s))  # w pasie szum jest jaśniejszy
-            x = rect.left()
-            while x < rect.right():
+        w, h = max(1, math.ceil(rect.width() / cell)), max(1, math.ceil(rect.height() / cell))
+        band = (now * 0.35 % 1) * h
+        img = QImage(w, h, QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        for y in range(h):
+            near = max(0.0, 1 - abs(y - band) * cell / (5 * s))  # w pasie szum jest jaśniejszy
+            for x in range(w):
                 v = rnd.random()
                 if v > 0.5:
-                    level = int(60 + 110 * v + 60 * near)
-                    p.fillRect(QRectF(x, y, cell, cell), QColor(level, level, level, int(70 + 80 * v)))
-                x += cell
-            y += cell
+                    level = min(255, int(60 + 110 * v + 60 * near))
+                    img.setPixelColor(x, y, QColor(level, level, level, int(70 + 80 * v)))
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.drawImage(QRectF(rect.left(), rect.top(), w * cell, h * cell), img)
+        p.restore()
 
     def _paint_error(self, p, rect, s, now):
         """Zakłócony obraz: przesunięte pasy w cyjanie i magencie, drgający napis ERR z rozszczepieniem kolorów."""
@@ -969,7 +1008,9 @@ class Light(QWidget):
 
     RAIN_GLYPHS = "01アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモ"
 
-    def _font(self, px):
+    @staticmethod
+    @functools.lru_cache(maxsize=16)
+    def _font(px):
         font = QFont("MS Gothic")
         font.setPixelSize(max(6, int(px)))
         font.setBold(True)
@@ -991,19 +1032,11 @@ class Light(QWidget):
             pos = head(now - k * 0.028)
             for i in range(cells):
                 levels[i] = max(levels[i], 0.8 ** k * max(0.0, 1 - abs(i - pos)))
-        lead = head(now)
-        glow = QRadialGradient(QPointF(rect.left() + 2 * s + lead * (cw + gap) + cw / 2, rect.center().y()), 9 * s)
-        gc = QColor(col)
-        gc.setAlphaF(0.45)
-        glow.setColorAt(0, gc)
-        gc.setAlphaF(0)
-        glow.setColorAt(1, gc)
-        p.setPen(Qt.NoPen)
-        p.setBrush(glow)
-        p.drawRect(rect)
+        lead = rect.left() + 2 * s + head(now) * (cw + gap) + cw / 2
+        self._center_glow(p, QPointF(lead, rect.center().y()), 9 * s, col, 0.45)
         for i, level in enumerate(levels):
             x = rect.left() + 2 * s + i * (cw + gap)
-            q = light_color(QColor(col), 0.35 * level) if level > 0.6 else QColor(col)
+            q = light_color(col, 0.35 * level) if level > 0.6 else QColor(col)
             q.setAlphaF(0.12 + 0.88 * level)
             p.fillRect(QRectF(x, y, cw, h), q)
 
@@ -1015,15 +1048,18 @@ class Light(QWidget):
         x0 = rect.center().x() - cols * ch / 2
         trail = 6
         span = rect.height() + trail * ch
+        shades = [light_color(col, 0.75)] + [QColor(col) for _ in range(trail - 1)]
+        for j, q in enumerate(shades[1:], 1):
+            q.setAlphaF(0.85 - j * 0.13)
         for k in range(cols):
             speed = 2.2 + (k * 0.61) % 1.4  # znaków na sekundę, różne dla kolumn
             head = rect.top() + (now * speed * ch + span * ((k * 0.618) % 1)) % span
             for j in range(trail):
                 y = head - j * ch
+                if y + ch / 2 < rect.top() or y - ch / 2 > rect.bottom():
+                    continue  # znak poza ekranem
                 glyph = self.RAIN_GLYPHS[int(now * 9 + k * 7 + j * 3) % len(self.RAIN_GLYPHS)]
-                q = light_color(col, 0.75) if j == 0 else QColor(col)
-                q.setAlphaF(1.0 if j == 0 else 0.85 - j * 0.13)
-                p.setPen(q)
+                p.setPen(shades[j])
                 p.drawText(QRectF(x0 + k * ch, y - ch / 2, ch, ch), Qt.AlignCenter, glyph)
 
     def _paint_glyph(self, p, rect, s, text, col, size, align, glitch=False):
@@ -1036,50 +1072,21 @@ class Light(QWidget):
         p.setPen(light_color(col, 0.2))
         p.drawText(rect, align, text)
 
-    def _paint_eq(self, p, body, g, now, lamp_off):
-        """Korektor: niskie, nieruchome słupki (bezczynny), tańczące (pracuje), podskakujące razem (czeka)."""
-        s = g["s"]
-        bars, bw, gap = 5, 3.4 * s, 2.5 * s
-        top, bottom = body.top() + g["pad"], body.bottom() - g["pad"]
-        full = bottom - top
-        x0 = body.center().x() - (bars * bw + (bars - 1) * gap) / 2
-        col = QColor(self.color(self.state))
-        shape = (0.6, 0.8, 1.0, 0.8, 0.6)
-        bounce = abs(math.sin(now * math.pi * 1.25))
-        p.setPen(Qt.NoPen)
-        for i in range(bars):
-            x = x0 + i * (bw + gap)
-            p.setBrush(QColor(*lamp_off))
-            p.drawRoundedRect(QRectF(x, top, bw, full), bw / 2, bw / 2)
-            if self.state == ERROR:  # słupki skaczą chaotycznie
-                level = self._rng(now, 20 + i).random()
-            elif self.state == OFFLINE:  # płaskie, wygaszone
-                level = 0
-            elif self.state == COMPACTING:  # fala ładowania przesuwa się od lewej do prawej
-                level = 0.15 + 0.85 * max(0.0, math.cos((now * 2.6 - i / bars) * math.tau)) ** 3
-            elif self.state == WORKING:
-                level = 0.55 + 0.25 * math.sin(now * 7.3 + i * 1.9) + 0.2 * math.sin(now * 4.1 * (1 + i * 0.17) + i)
-            elif self.state == WAITING:
-                level = (0.3 + 0.7 * bounce) * shape[i]
-            else:
-                level = 0.22 + 0.08 * shape[i]
-            h = max(bw, full * min(1.0, max(0.12, level)))
-            p.setBrush(col)
-            p.drawRoundedRect(QRectF(x, bottom - h, bw, h), bw / 2, bw / 2)
-
     def tray_icon(self):
+        """Ikona w zasobniku: mały ekran Matrix w kolorze stanu zbiorczego."""
         pm = QPixmap(32, 32)
         pm.fill(Qt.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(16, 19, 23))
-        p.drawRoundedRect(QRectF(2, 2, 28, 28), 14, 14)
-        col = QColor(self.color(self.state))
+        col = QColor(COLOR[self.state])
         if self.cfg["dnd_manual"]:
             col.setAlphaF(0.4)
+        p.setPen(QPen(col, 2.5))
+        p.setBrush(QColor(16, 19, 23))
+        p.drawRoundedRect(QRectF(2.5, 2.5, 27, 27), 3, 3)
+        p.setPen(Qt.NoPen)
         p.setBrush(col)
-        p.drawEllipse(QPointF(16, 16), 8, 8)
+        p.drawRoundedRect(QRectF(8, 19, 11, 4), 1, 1)  # kursor terminala
         p.end()
         return QIcon(pm)
 
@@ -1090,14 +1097,11 @@ class Light(QWidget):
             self._moved = False
 
     def event(self, e):
-        if e.type() == QEvent.ToolTip and self.cfg["orientation"] == "matrix" and self.sessions:
-            for rect, sess in self.matrix_tiles():
-                if sess and rect.contains(QPointF(e.pos())):
-                    text = self.session_line(sess)
-                    if sess.get("detail") and sess["state"] != IDLE:
-                        text += f"\n    {sess['detail']}"
-                    QToolTip.showText(e.globalPos(), text, self)
-                    return True
+        if e.type() == QEvent.ToolTip:  # podpowiedź nad kafelkiem: tylko ta sesja
+            sess = self.tile_at(QPointF(e.pos()))
+            if sess:
+                QToolTip.showText(e.globalPos(), self.session_text(sess), self)
+                return True
         return super().event(e)
 
     def mouseMoveEvent(self, e):
@@ -1118,18 +1122,10 @@ class Light(QWidget):
             self.apply_layer()  # kliknięcie = "widzę, schowaj"
 
     def handle_click(self, pos):
-        g = self.dims()
-        if self.cfg["orientation"] == "matrix":
-            for rect, sess in self.matrix_tiles(g):
-                if sess and rect.contains(pos):
-                    self.focus_session(sess)
-                    return
-        hit = max(g["dot"] / 2 + g["dgap"] / 2, 5)
-        for s, c in zip(self.sessions, self.dot_centers(g)):
-            if abs(pos.x() - c.x()) <= hit and abs(pos.y() - c.y()) <= hit + 2:
-                self.focus_session(s)
-                return
-        if self.cfg["click_jumps"]:
+        sess = self.tile_at(pos)
+        if sess:
+            self.focus_session(sess)
+        elif self.cfg["click_jumps"]:
             waiting = [s for s in self.sessions if s["state"] == WAITING]
             if waiting:
                 self.focus_session(min(waiting, key=lambda s: float(s.get("since") or 0)))
@@ -1153,37 +1149,37 @@ class Light(QWidget):
 
         target = self.attention_session()
         if target:
-            label = "Przejdź do czekającego agenta" if target["state"] == WAITING else "Przejdź do ostatniej sesji"
+            label = T("Przejdź do czekającego agenta" if target["state"] == WAITING else "Przejdź do ostatniej sesji")
             a = menu.addAction(f"{label}: {target.get('project', '?')}", lambda *_, s=target: self.focus_session(s))
             if self._hotkey_on:
                 a.setShortcut(QKeySequence(self.cfg["hotkey"]))
                 a.setShortcutVisibleInContextMenu(True)
 
-        sub = menu.addMenu(f"Sesje ({len(self.sessions)})")
+        sub = menu.addMenu(T("Sesje ({n})").format(n=len(self.sessions)))
         if not self.sessions:
-            sub.addAction("Brak aktywnych sesji").setEnabled(False)
+            sub.addAction(T("Brak aktywnych sesji")).setEnabled(False)
         for s in self.sessions:
             a = sub.addAction(self.session_line(s), lambda *_, s=s: self.focus_session(s))
-            a.setIcon(self._dot_icon(self.dot_color(s["state"])))
+            a.setIcon(self._dot_icon(COLOR[s["state"]]))
             a.setToolTip(s.get("cwd", ""))
         sub.addSeparator()
-        sub.addAction("Wyczyść listę sesji", self.clear_sessions)
+        sub.addAction(T("Wyczyść listę sesji"), self.clear_sessions)
 
         menu.addSeparator()
         grp = QActionGroup(menu)
         for key, text in (("top", "Zawsze na wierzchu"), ("under", "Pod oknami, wyskakuj przy zmianie")):
-            a = QAction(text, menu, checkable=True, checked=self.cfg["mode"] == key)
+            a = QAction(T(text), menu, checkable=True, checked=self.cfg["mode"] == key)
             a.triggered.connect(lambda _=False, k=key: self.set_mode(k))
             grp.addAction(a)
             menu.addAction(a)
-        dnd = QAction("Nie przeszkadzać", menu, checkable=True, checked=self.cfg["dnd_manual"])
+        dnd = QAction(T("Nie przeszkadzać"), menu, checkable=True, checked=self.cfg["dnd_manual"])
         dnd.triggered.connect(self.toggle_dnd)
         menu.addAction(dnd)
 
         menu.addSeparator()
-        menu.addAction("Ustawienia…", self.open_settings)
+        menu.addAction(T("Ustawienia…"), self.open_settings)
         menu.addSeparator()
-        menu.addAction("Zamknij", QApplication.quit)
+        menu.addAction(T("Zamknij"), QApplication.quit)
 
     @staticmethod
     def _dot_icon(color):
@@ -1219,6 +1215,7 @@ class Light(QWidget):
         if dlg.exec() == QDialog.Accepted:
             self.cfg.update(dlg.values())
             save_config(self.cfg)
+            set_language(self.cfg)
             try:
                 set_autostart(self.cfg["autostart"])
             except OSError:
@@ -1237,7 +1234,7 @@ class Light(QWidget):
         self.apply_appearance()
 
 
-APPEARANCE_KEYS = ("housing", "state_rim", "glow", "opacity", "scale", "orientation", "show_dots")
+APPEARANCE_KEYS = ("housing", "state_rim", "glow", "opacity", "scale")
 
 # nazwa -> (obudowa, obwódka w kolorze stanu)
 STYLE_PRESETS = [
@@ -1260,7 +1257,7 @@ class SoundPicker(QWidget):
         super().__init__()
         self.combo = QComboBox()
         self.combo.setMinimumWidth(220)
-        self.combo.addItem("Brak", "")
+        self.combo.addItem(T("Brak"), "")
         try:
             names = sorted(n for n in os.listdir(MEDIA_DIR) if n.lower().endswith(".wav"))
         except OSError:
@@ -1269,13 +1266,13 @@ class SoundPicker(QWidget):
             self.combo.addItem(n[:-4], n)
         if value and self.combo.findData(value) < 0:
             self.combo.addItem(os.path.basename(value), value)
-        self.combo.addItem("Wybierz plik .wav…", self.BROWSE)
+        self.combo.addItem(T("Wybierz plik .wav…"), self.BROWSE)
         self.combo.setCurrentIndex(max(self.combo.findData(value), 0))
         self._last = self.combo.currentIndex()
         self.combo.currentIndexChanged.connect(self._picked)
 
         play = QToolButton(text="▶")
-        play.setToolTip("Odtwórz")
+        play.setToolTip(T("Odtwórz"))
         play.clicked.connect(lambda: play_sound(self.value()))
 
         h = QHBoxLayout(self)
@@ -1287,7 +1284,7 @@ class SoundPicker(QWidget):
         if self.combo.itemData(idx) != self.BROWSE:
             self._last = idx
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Wybierz dźwięk", MEDIA_DIR, "Dźwięki (*.wav)")
+        path, _ = QFileDialog.getOpenFileName(self, T("Wybierz dźwięk"), MEDIA_DIR, T("Dźwięki (*.wav)"))
         self.combo.blockSignals(True)
         if path:
             path = os.path.normpath(path)
@@ -1308,20 +1305,20 @@ class SoundPicker(QWidget):
 class SettingsDialog(QDialog):
     def __init__(self, cfg, on_preview=None):
         super().__init__(None, Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle("AI Status Widget — ustawienia")
+        self.setWindowTitle(T("AI Status Widget — ustawienia"))
         self.setMinimumWidth(540)
         self._on_preview = on_preview
         self._loading = True
 
         # --- Zachowanie
         self.mode = QComboBox()
-        self.mode.addItem("Zawsze na wierzchu", "top")
-        self.mode.addItem("Pod oknami, wyskakuje przy zmianie", "under")
+        self.mode.addItem(T("Zawsze na wierzchu"), "top")
+        self.mode.addItem(T("Pod oknami, wyskakuje przy zmianie"), "under")
         self.pop_rule = QComboBox()
-        self.pop_rule.addItem("Przy każdej zmianie koloru", "any")
-        self.pop_rule.addItem("Tylko gdy ktoś czeka (pomarańczowe)", "waiting")
+        self.pop_rule.addItem(T("Przy każdej zmianie stanu"), "any")
+        self.pop_rule.addItem(T("Tylko gdy ktoś czeka (pomarańczowe)"), "waiting")
         self.pop_seconds = QSpinBox(minimum=0, maximum=600, suffix=" s")
-        self.pop_seconds.setSpecialValueText("do kliknięcia")
+        self.pop_seconds.setSpecialValueText(T("do kliknięcia"))
         self.stale = QSpinBox(minimum=1, maximum=240, suffix=" min")
         self.hotkey = QKeySequenceEdit(QKeySequence(cfg["hotkey"]))
         if hasattr(self.hotkey, "setMaximumSequenceLength"):
@@ -1331,22 +1328,22 @@ class SettingsDialog(QDialog):
         self.hotkey_lbl = QLabel()
         self.hotkey_lbl.setObjectName("hint")
         self.hotkey.keySequenceChanged.connect(self._check_hotkey)
-        self.click_jumps = QCheckBox("Kliknięcie w widget przełącza do czekającego terminala")
-        self.question_waiting = QCheckBox("Odpowiedź agenta zakończona pytaniem = czeka na Ciebie (pomarańczowe)")
+        self.click_jumps = QCheckBox(T("Kliknięcie w widget przełącza do czekającego terminala"))
+        self.question_waiting = QCheckBox(T("Odpowiedź agenta zakończona pytaniem = czeka na Ciebie (pomarańczowe)"))
 
         # --- Nie przeszkadzać (w zakładce Zachowanie)
-        self.dnd_fullscreen = QCheckBox("Gdy aplikacja jest na pełnym ekranie (prezentacja, gra, wideo)")
-        self.dnd_hours = QCheckBox("W godzinach")
+        self.dnd_fullscreen = QCheckBox(T("Gdy aplikacja jest na pełnym ekranie (prezentacja, gra, wideo)"))
+        self.dnd_hours = QCheckBox(T("W godzinach"))
         self.dnd_from = QTimeEdit(QTime.fromString(cfg["dnd_from"], "HH:mm"), displayFormat="HH:mm")
         self.dnd_to = QTimeEdit(QTime.fromString(cfg["dnd_to"], "HH:mm"), displayFormat="HH:mm")
         self.dnd_hours.toggled.connect(lambda on: (self.dnd_from.setEnabled(on), self.dnd_to.setEnabled(on)))
 
         # --- Dźwięki
         self.sound_waiting = SoundPicker(cfg["sound_waiting"])
-        self.notify_long = QCheckBox("Zagraj dźwięk, gdy agent skończy długie zadanie")
+        self.notify_long = QCheckBox(T("Zagraj dźwięk, gdy agent skończy długie zadanie"))
         self.long_minutes = QSpinBox(minimum=1, maximum=240, suffix=" min")
         self.sound_long = SoundPicker(cfg["sound_long_task"])
-        self.idle_remind = QCheckBox("Zagraj dźwięk, gdy sesja długo czeka na kolejne polecenie")
+        self.idle_remind = QCheckBox(T("Zagraj dźwięk, gdy sesja długo czeka na kolejne polecenie"))
         self.idle_minutes = QSpinBox(minimum=1, maximum=480, suffix=" min")
         self.sound_idle = SoundPicker(cfg["sound_idle"])
         self.notify_long.toggled.connect(lambda on: (self.long_minutes.setEnabled(on), self.sound_long.setEnabled(on)))
@@ -1355,14 +1352,14 @@ class SettingsDialog(QDialog):
         # --- Wygląd
         self.preset = QComboBox()
         for name, housing, rim in STYLE_PRESETS:
-            self.preset.addItem(name, (housing, rim))
-        self.preset.addItem("Własny", None)
+            self.preset.addItem(T(name), (housing, rim))
+        self.preset.addItem(T("Własny"), None)
         self.housing = QComboBox()
-        self.housing.addItem("Ciemna", "dark")
-        self.housing.addItem("Jasna", "light")
-        self.housing.addItem("Szklana (półprzezroczysta)", "glass")
-        self.housing.addItem("Automatyczna (dopasuj do tła)", "auto")
-        self.state_rim = QCheckBox("Obwódka i poświata w kolorze aktualnego stanu")
+        self.housing.addItem(T("Ciemna"), "dark")
+        self.housing.addItem(T("Jasna"), "light")
+        self.housing.addItem(T("Szklana (półprzezroczysta)"), "glass")
+        self.housing.addItem(T("Automatyczna (dopasuj do tła)"), "auto")
+        self.state_rim = QCheckBox(T("Obwódka i poświata w kolorze aktualnego stanu"))
         self.glow = QSlider(Qt.Horizontal, minimum=0, maximum=100)
         self.glow_lbl = QLabel()
         self.opacity = QSlider(Qt.Horizontal, minimum=30, maximum=100)
@@ -1370,26 +1367,23 @@ class SettingsDialog(QDialog):
         self.scale = QComboBox()
         for v in (1.0, 1.25, 1.5, 2.0, 2.5):
             self.scale.addItem(f"{int(v * 100)}%", v)
-        self.orientation = QComboBox()
-        self.orientation.addItem("Pionowy", "vertical")
-        self.orientation.addItem("Poziomy", "horizontal")
-        self.orientation.addItem("Jedno światło (zmienia kolor)", "single")
-        self.orientation.addItem("Matrix (kwadratowy ekran)", "matrix")
-        self.orientation.addItem("Korektor (słupki)", "eq")
-        self.show_dots = QCheckBox("Pokazuj kropki sesji pod widgetem (poza układem Matrix)")
 
         # --- System
-        self.autostart = QCheckBox("Uruchamiaj razem z Windows")
+        self.autostart = QCheckBox(T("Uruchamiaj razem z Windows"))
+        self.language = QComboBox()
+        self.language.addItem(T("Automatycznie (język systemu)"), "auto")
+        self.language.addItem("Polski", "pl")
+        self.language.addItem("English", "en")
         self.hooks_lbl = QLabel()
         self.hooks_btn = QPushButton()
         self.hooks_btn.clicked.connect(self.toggle_hooks)
         self._refresh_hooks()
-        open_dir = QPushButton("Otwórz folder stanu")
+        open_dir = QPushButton(T("Otwórz folder stanu"))
         open_dir.clicked.connect(lambda: (os.makedirs(SESSIONS_DIR, exist_ok=True), os.startfile(APP_DIR)))
 
         # --- wartości początkowe
         for combo, key in ((self.mode, "mode"), (self.pop_rule, "pop_rule"), (self.scale, "scale"),
-                           (self.orientation, "orientation"), (self.housing, "housing")):
+                           (self.housing, "housing"), (self.language, "language")):
             combo.setCurrentIndex(max(combo.findData(cfg[key]), 0))
         self.pop_seconds.setValue(int(cfg["pop_seconds"]))
         self.stale.setValue(int(cfg["stale_minutes"]))
@@ -1410,7 +1404,6 @@ class SettingsDialog(QDialog):
         self.state_rim.setChecked(cfg["state_rim"])
         self.glow.setValue(int(cfg["glow"] * 100))
         self.opacity.setValue(int(cfg["opacity"] * 100))
-        self.show_dots.setChecked(cfg["show_dots"])
         self.autostart.setChecked(cfg["autostart"])
         self._check_hotkey()
 
@@ -1446,7 +1439,7 @@ class SettingsDialog(QDialog):
             ("", hours),
         ], "W trybie „Nie przeszkadzać” widget nadal zmienia kolor, ale nie wyskakuje na wierzch, "
            "nie gra dźwięków. Można go też włączyć ręcznie w menu pod prawym przyciskiem."),
-            "Zachowanie")
+            T("Zachowanie"))
         tabs.addTab(self._page([
             "Ktoś czeka na odpowiedź",
             ("Dźwięk", self.sound_waiting),
@@ -1461,7 +1454,7 @@ class SettingsDialog(QDialog):
             ("Bezczynna od", self.idle_minutes),
             ("Dźwięk", self.sound_idle),
         ], "Tylko dźwięki – widget nie pokazuje dymków Windows. Przycisk ▶ odtwarza wybrany dźwięk. "
-           "W trybie „Nie przeszkadzać” dźwięki są wyciszone."), "Dźwięki")
+           "W trybie „Nie przeszkadzać” dźwięki są wyciszone."), T("Dźwięki"))
         tabs.addTab(self._page([
             ("Gotowy styl", self.preset),
             None,
@@ -1471,24 +1464,24 @@ class SettingsDialog(QDialog):
             ("Krycie tła", self._with_label(self.opacity, self.opacity_lbl)),
             None,
             ("Rozmiar", self.scale),
-            ("Układ", self.orientation),
-            ("", self.show_dots),
         ], "Zmiany widać od razu na widgecie, a Anuluj przywraca poprzedni wygląd. "
-           "Obudowa automatyczna co 1,5 s sprawdza jasność tła i wybiera jasną albo ciemną kapsułę."), "Wygląd")
+           "Obudowa automatyczna co 1,5 s sprawdza jasność tła i wybiera jasne albo ciemne kafelki."), T("Wygląd"))
         hk_w = QWidget()
         hk = QHBoxLayout(hk_w)
         hk.setContentsMargins(0, 0, 0, 0)
         hk.addWidget(self.hooks_lbl, 1)
         hk.addWidget(self.hooks_btn)
         tabs.addTab(self._page([
+            ("Język / Language", self.language),
             ("", self.autostart),
             ("Hooki Claude Code", hk_w),
             ("", open_dir),
-        ], "Hooki działają w sesjach Claude Code uruchomionych po instalacji."), "System")
+        ], "Hooki działają w sesjach Claude Code uruchomionych po instalacji. Zmiana języka działa po zapisaniu."),
+            T("System"))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText("Zapisz")
-        buttons.button(QDialogButtonBox.Cancel).setText("Anuluj")
+        buttons.button(QDialogButtonBox.Save).setText(T("Zapisz"))
+        buttons.button(QDialogButtonBox.Cancel).setText(T("Anuluj"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -1501,10 +1494,9 @@ class SettingsDialog(QDialog):
         # --- sygnały
         self.mode.currentIndexChanged.connect(self._sync_enabled)
         self.preset.currentIndexChanged.connect(self._apply_preset)
-        for w in (self.housing, self.scale, self.orientation):
+        for w in (self.housing, self.scale):
             w.currentIndexChanged.connect(self._changed)
-        for w in (self.state_rim, self.show_dots):
-            w.toggled.connect(self._changed)
+        self.state_rim.toggled.connect(self._changed)
         for w in (self.glow, self.opacity):
             w.valueChanged.connect(self._changed)
         self._loading = False
@@ -1537,14 +1529,14 @@ class SettingsDialog(QDialog):
                 line.setAttribute(Qt.WA_StyledBackground)
                 form.addRow(line)
             elif isinstance(row, str):
-                lbl = QLabel(row.upper())
+                lbl = QLabel(T(row).upper())
                 lbl.setObjectName("section")
                 form.addRow(lbl)
             else:
-                form.addRow(row[0], row[1])
+                form.addRow(T(row[0]), row[1])
         v.addLayout(form)
         v.addStretch(1)
-        hint = QLabel(hint_text)
+        hint = QLabel(T(hint_text))
         hint.setWordWrap(True)
         hint.setObjectName("hint")
         v.addWidget(hint)
@@ -1558,11 +1550,11 @@ class SettingsDialog(QDialog):
     def _check_hotkey(self):
         text = self.hotkey.keySequence().toString()
         if not text:
-            self.hotkey_lbl.setText("Wyłączony. Kliknij pole i naciśnij kombinację klawiszy.")
+            self.hotkey_lbl.setText(T("Wyłączony. Kliknij pole i naciśnij kombinację klawiszy."))
         elif parse_hotkey(text) is None:
-            self.hotkey_lbl.setText("Nieobsługiwany klawisz: użyj litery, cyfry, F1–F24 albo spacji z Ctrl/Alt/Shift/Win.")
+            self.hotkey_lbl.setText(T("Nieobsługiwany klawisz: użyj litery, cyfry, F1–F24 albo spacji z Ctrl/Alt/Shift/Win."))
         else:
-            self.hotkey_lbl.setText("Przełącza do najdłużej czekającego agenta, a gdy nikt nie czeka, do ostatniej sesji.")
+            self.hotkey_lbl.setText(T("Przełącza do najdłużej czekającego agenta, a gdy nikt nie czeka, do ostatniej sesji."))
 
     def _apply_preset(self):
         data = self.preset.currentData()
@@ -1592,8 +1584,8 @@ class SettingsDialog(QDialog):
 
     def _refresh_hooks(self):
         on = hooks_installed()
-        self.hooks_lbl.setText("zainstalowane" if on else "niezainstalowane")
-        self.hooks_btn.setText("Usuń" if on else "Zainstaluj")
+        self.hooks_lbl.setText(T("zainstalowane" if on else "niezainstalowane"))
+        self.hooks_btn.setText(T("Usuń" if on else "Zainstaluj"))
 
     def toggle_hooks(self):
         sys_argv = sys.argv
@@ -1630,9 +1622,8 @@ class SettingsDialog(QDialog):
             "glow": self.glow.value() / 100,
             "opacity": self.opacity.value() / 100,
             "scale": self.scale.currentData(),
-            "orientation": self.orientation.currentData(),
-            "show_dots": self.show_dots.isChecked(),
             "autostart": self.autostart.isChecked(),
+            "language": self.language.currentData(),
         }
 
 
@@ -1679,7 +1670,9 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(STYLE)
-    w = Light(load_config())
+    cfg = load_config()
+    set_language(cfg)
+    w = Light(cfg)
     w.show()
     w.apply_layer()
     w.register_hotkey()

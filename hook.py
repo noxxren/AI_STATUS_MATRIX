@@ -111,23 +111,32 @@ def _text_of(content):
     return ""
 
 
+def tail_entries(path, size=65536):
+    """Wpisy z końca zapisu rozmowy (JSONL), od najnowszego. Pusta lista, gdy pliku nie da się przeczytać."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - size))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue  # pierwsza, ucięta linia albo wpis właśnie dopisywany
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
 def _tail_final_text(path):
     """Tekst ostatniej odpowiedzi agenta z zapisu rozmowy.
 
     None = końcowa odpowiedź nie jest jeszcze zapisana (ostatni wpis to prompt, wynik narzędzia
     albo wywołanie narzędzia)."""
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 262144))
-            lines = f.read().decode("utf-8", "replace").splitlines()
-    except OSError:
-        return ""
-    for line in reversed(lines):
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
+    for obj in tail_entries(path, 262144):
         kind = obj.get("type")
         if kind == "user":
             return None
@@ -147,26 +156,20 @@ def api_error(data):
     path = data.get("transcript_path")
     if not path:
         return ""
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 65536))
-            lines = f.read().decode("utf-8", "replace").splitlines()
-    except OSError:
-        return ""
-    for line in reversed(lines):
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
+    for obj in tail_entries(path):
         kind = obj.get("type")
         if kind == "user":
             return ""
         if kind == "assistant":
-            if not obj.get("isApiErrorMessage"):
-                return ""
-            return _text_of((obj.get("message") or {}).get("content")).strip() or "API Error"
+            return error_text(obj)
     return ""
+
+
+def error_text(entry):
+    """Tekst błędu API z wpisu agenta oznaczonego "isApiErrorMessage", inaczej ""."""
+    if not entry.get("isApiErrorMessage"):
+        return ""
+    return _text_of((entry.get("message") or {}).get("content")).strip() or "API Error"
 
 
 def final_text(data):
