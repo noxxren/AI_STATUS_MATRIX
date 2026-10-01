@@ -7,9 +7,12 @@ Minimalistyczny widget na pulpit Windows, który pokazuje, co robią agenci AI w
 | zielone | wszyscy agenci bezczynni |
 | czerwone | przynajmniej jeden pracuje |
 | pomarańczowe (pulsuje) | ktoś czeka na Twoją odpowiedź; ma pierwszeństwo przed czerwonym |
+| niebieskie (ładowanie) | agent kompaktuje kontekst rozmowy (`/compact` albo automatycznie) |
+| magentowy glitch | tura skończyła się błędem API albo sesja „pracuje” bez żadnych zdarzeń (zawieszona) |
+| wygaszony, szary (Matrix: szum) | brak jakiejkolwiek sesji – agent nie działa albo hooki nie są zainstalowane |
 
-Małe kropki pod sygnalizatorem to poszczególne sesje. Szara kropka oznacza sesję bez sygnału
-(np. przerwaną klawiszem Esc albo zamkniętym terminalem).
+Małe kropki pod sygnalizatorem to poszczególne sesje. Szara kropka oznacza sesję zawieszoną
+(pracuje, ale od dłuższego czasu nie przyszło żadne zdarzenie).
 
 ## Jak to działa
 
@@ -56,6 +59,9 @@ Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na
   W terminalach z kartami przełącza do okna, nie do konkretnej karty.
 - **Przerwanie (Esc)** – co ~2 s widget sprawdza koniec zapisu rozmowy (`transcript_path`); wpis
   „Request interrupted by user” od razu przestawia sesję na bezczynną.
+- **Błąd tury** – wpis z `isApiErrorMessage` na końcu zapisu rozmowy (np. „API Error: 500”, zerwane połączenie)
+  przestawia sesję na błąd. Sprawdza to hook przy `Stop` i widget co ~2 s, bo po błędzie `Stop` nie zawsze przychodzi.
+  Kolejne polecenie wysłane do agenta kasuje błąd.
 - **Zamknięty terminal** – sesja, której proces agenta już nie żyje, znika od razu (PID + czas utworzenia procesu).
 - **Liczniki** – w podpowiedzi i menu: jak długo sesja pracuje / czeka / jest bezczynna.
 - **Dźwięki** – gdy ktoś czeka, gdy agent skończy zadanie dłuższe niż próg (domyślnie 3 min) i gdy sesja
@@ -75,6 +81,8 @@ a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | pracuje |
 | `Notification` (`permission_prompt`), `PreToolUse` dla `AskUserQuestion` / `ExitPlanMode` | czeka |
 | `Stop`, gdy ostatni akapit odpowiedzi zawiera pytanie („Mam to zrobić?”) | czeka (opcja w Ustawienia → Zachowanie) |
+| `Stop` (albo jego brak), gdy tura skończyła się błędem API | błąd |
+| `PreCompact` | kompaktuje; po nim `SessionStart` (`source: compact`) wraca do pracy (auto) albo bezczynności (`/compact`) |
 | `Notification` (`idle_prompt` i inne informacyjne) | bez zmiany |
 | `SessionEnd` | sesja znika |
 
@@ -85,7 +93,7 @@ Konfiguracji nie instalujemy automatycznie – przykłady:
 
 - **Gemini CLI** (`~/.gemini/settings.json`, sekcja `hooks`): komenda
   `python -S D:/tools/ai-traffic-light/hook.py --cli gemini` dla `SessionStart`, `BeforeAgent`,
-  `BeforeTool`, `AfterAgent`, `Notification`, `SessionEnd`.
+  `BeforeTool`, `AfterAgent`, `PreCompress`, `Notification`, `SessionEnd`.
 - **Codex CLI** (`~/.codex/config.toml`):
   `notify = ["python", "-S", "D:/tools/ai-traffic-light/hook.py", "--cli", "codex"]`.
   Codex zgłasza tylko koniec tury, więc pokaże zielone po skończeniu pracy, ale nie czerwone na jej początku.
@@ -100,6 +108,9 @@ Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakła
   (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa (ciemna / jasna / szklana / automatyczna według jasności tła),
   obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ, kropki sesji.
-  Układy: sygnalizator pionowy / poziomy, jedno światło zmieniające kolor, **pierścień** (przy pracy obraca się łuk)
+  Układy: sygnalizator pionowy / poziomy, jedno światło zmieniające kolor, **Matrix** (kwadratowy ekran na każdą sesję – siatka rośnie: 1, 2×1, 2×2, 3×2…; kursor `>_`,
+  deszcz znaków przy pracy, glitchujący `?`, gdy ktoś czeka, przy kompaktowaniu niebieski skaner
+  jak KITT z „Knight Ridera”; własna paleta: praca w butelkowej zieleni, bezczynność biało-turkusowa;
+  kliknięcie w kafelek przełącza do jego terminala, przy krawędzi ekranu widget rośnie w stronę środka)
   i **korektor** (słupki: nieruchome, tańczące przy pracy, podskakujące razem, gdy ktoś czeka).
 - **System** – autostart z Windows, instalacja/usunięcie hooków, folder stanu.

@@ -20,7 +20,8 @@ STATE_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-traffic-light", "sessions"
 )
 
-IDLE, WORKING, WAITING, END = "idle", "working", "waiting", "end"
+IDLE, WORKING, WAITING, ERROR, END = "idle", "working", "waiting", "error", "end"
+COMPACTING = "compacting"  # kompaktowanie (streszczanie) kontekstu rozmowy
 KEEP = "keep"  # zdarzenie informacyjne: zostaw poprzedni stan
 
 # Nazwy zdarzeń: Claude Code, Gemini CLI (Before*/After*) i Codex CLI (notify: "type").
@@ -32,6 +33,7 @@ EVENT_STATE = {
     "PostToolUseFailure": WORKING,
     "PermissionRequest": WAITING,
     "Stop": IDLE,
+    "PreCompact": COMPACTING,
     "SessionEnd": END,
     # Gemini CLI
     "BeforeAgent": WORKING,
@@ -39,6 +41,7 @@ EVENT_STATE = {
     "BeforeTool": WORKING,
     "AfterTool": WORKING,
     "AfterAgent": IDLE,
+    "PreCompress": COMPACTING,
     # Codex CLI (notify)
     "agent-turn-complete": IDLE,
 }
@@ -139,6 +142,33 @@ def _tail_final_text(path):
     return ""
 
 
+def api_error(data):
+    """Tekst błędu API, jeśli tura skończyła się błędem (wpis z "isApiErrorMessage"), inaczej ""."""
+    path = data.get("transcript_path")
+    if not path:
+        return ""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        kind = obj.get("type")
+        if kind == "user":
+            return ""
+        if kind == "assistant":
+            if not obj.get("isApiErrorMessage"):
+                return ""
+            return _text_of((obj.get("message") or {}).get("content")).strip() or "API Error"
+    return ""
+
+
 def final_text(data):
     msg = data.get("last_assistant_message")
     if isinstance(msg, str) and msg.strip():
@@ -210,6 +240,9 @@ def main():
     state = resolve_state(event, data)
     if state is None:
         return
+    error = api_error(data) if event == "Stop" else ""
+    if error:
+        state = ERROR  # tura przerwana błędem API (serwer, połączenie, limit)
 
     sid = str(data.get("session_id") or data.get("thread-id") or data.get("thread_id") or "")
     if not sid:
@@ -230,6 +263,10 @@ def main():
     except (OSError, ValueError):
         prev = {}
 
+    if event == "SessionStart" and data.get("source") == "compact":
+        # koniec kompaktowania: automatyczne dzieje się w trakcie pracy, ręczne (/compact) kończy się bezczynnością
+        state = WORKING if prev.get("compact_trigger") == "auto" else IDLE
+
     keep = state == KEEP
     if keep:
         if not prev:
@@ -249,6 +286,8 @@ def main():
         # pytanie, którym agent zakończył odpowiedź (widget pokazuje wtedy pomarańczowe)
         "question": prev.get("question", "") if keep else "",
         "ts": now,
+        # kiedy sesja pojawiła się pierwszy raz (kolejność kafelków w układzie Matrix)
+        "started": prev.get("started", now),
         # od kiedy trwa obecny stan (do liczników w podpowiedzi i przypomnień)
         "since": prev.get("since", now) if prev.get("state") == state else now,
         # początek pracy od ostatniego "bezczynny" (czekanie na zgodę też się liczy)
@@ -257,10 +296,15 @@ def main():
         "transcript_path": data.get("transcript_path") or prev.get("transcript_path"),
         "pid": prev.get("pid"),
         "pid_created": prev.get("pid_created"),
+        "compact_trigger": data.get("trigger") if state == COMPACTING else prev.get("compact_trigger"),
     }
+    if state == COMPACTING:
+        record["detail"] = "kompaktowanie kontekstu" + (" (auto)" if data.get("trigger") == "auto" else "")
     if state == IDLE and prev.get("work_started"):
         record["last_work_seconds"] = round(now - prev["work_started"], 1)
-    if event in ("Stop", "AfterAgent"):
+    if error:
+        record["detail"] = error[:120]
+    elif event in ("Stop", "AfterAgent"):
         record["question"] = question_of(final_text(data))
         if record["question"]:
             record["detail"] = record["question"]

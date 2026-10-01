@@ -26,6 +26,7 @@ EVENTS = [
     ("PostToolUse", "*"),
     ("Notification", None),
     ("Stop", None),
+    ("PreCompact", None),
     ("SessionEnd", None),
 ]
 
