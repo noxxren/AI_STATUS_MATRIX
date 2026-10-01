@@ -1,6 +1,9 @@
-# AI_STATUS_WIDGET
+# AI_STATUS_MATRIX
 
 **English** | [Polski](README.pl.md)
+
+<p align="center"><img src="docs/demo.gif" alt="AI Status Matrix – all states"></p>
+<p align="center"><sub>Top: working, idle, waiting · bottom: compacting, error, no sessions</sub></p>
 
 A minimal Windows desktop widget that shows what your AI agents are doing in their terminals.
 Each session (terminal) gets its own square Matrix-style screen; the grid grows like text in a book:
@@ -15,6 +18,7 @@ Each session (terminal) gets its own square Matrix-style screen; the grid grows 
 | magenta `ERR` glitch | the turn ended with an API error, or the session is “working” with no events (stalled) |
 | grey noise | no sessions at all – the agent is not running or the hooks are not installed |
 
+The project (terminal folder) name is shown on a strip at the bottom of each tile (can be turned off).
 Clicking a tile switches to that session's terminal; hovering shows its details.
 Near a screen edge the widget grows towards the center.
 
@@ -23,7 +27,7 @@ The interface is available in English and Polish (Settings → System → Langua
 ## How it works
 
 ```
-Claude Code ──hook──▶ hook.py ──write──▶ %LOCALAPPDATA%\ai-traffic-light\sessions\<session_id>.json
+Claude Code ──hook──▶ hook.py ──write──▶ %LOCALAPPDATA%\ai-status-matrix\sessions\<session_id>.json
                                                                │
                                    widget.pyw ◀──read every 300 ms
 ```
@@ -79,7 +83,7 @@ The tray icon has the same menu; clicking it brings the widget to the front.
 ## Event mapping
 
 Tools of helper agents (subagents, an agent started by a `Stop` hook) carry `agent_id` in their data
-and do not change the state. Diagnostics: create an empty file `%LOCALAPPDATA%\ai-traffic-light\debug`,
+and do not change the state. Diagnostics: create an empty file `%LOCALAPPDATA%\ai-status-matrix\debug`,
 and the hook will append raw events to `debug.log` in the same folder.
 
 | Event | State |
@@ -99,21 +103,22 @@ and the hook will append raw events to `debug.log` in the same folder.
 Their configuration is not installed automatically – examples:
 
 - **Gemini CLI** (`~/.gemini/settings.json`, `hooks` section): command
-  `python -S D:/tools/ai-traffic-light/hook.py --cli gemini` for `SessionStart`, `BeforeAgent`,
+  `python -S C:/path/to/AI_STATUS_MATRIX/hook.py --cli gemini` for `SessionStart`, `BeforeAgent`,
   `BeforeTool`, `AfterAgent`, `PreCompress`, `Notification`, `SessionEnd`.
 - **Codex CLI** (`~/.codex/config.toml`):
-  `notify = ["python", "-S", "D:/tools/ai-traffic-light/hook.py", "--cli", "codex"]`.
+  `notify = ["python", "-S", "C:/path/to/AI_STATUS_MATRIX/hook.py", "--cli", "codex"]`.
   Codex only reports the end of a turn, so it shows idle after the work is done, but not the work itself.
 
 ## Settings
 
-Stored in `%LOCALAPPDATA%\ai-traffic-light\config.json`, split into tabs:
+Stored in `%LOCALAPPDATA%\ai-status-matrix\config.json`, split into tabs:
 
 - **Behavior** – layer (always on top / below windows), when to pop up, how long to stay on top,
   time until a session counts as stalled, keyboard shortcut, click switches to terminal, Do not disturb.
 - **Sounds** – sound when waiting, long task finished (threshold + sound), idle reminder
   (time + sound). Sounds from `C:\Windows\Media` or your own `.wav` file; the ▶ button plays the selected one.
 - **Appearance** (live preview) – preset, tile housing (dark / light / glass / automatic based on background
-  brightness), rim and glow in the state color (on by default), glow strength, background opacity, size.
+  brightness), rim and glow in the state color (on by default), glow strength, background opacity, size
+  (100% = 60 px tile), project name on the tile.
 - **System** – language (automatic from Windows / Polish / English), start with Windows,
   install/remove hooks, state folder.

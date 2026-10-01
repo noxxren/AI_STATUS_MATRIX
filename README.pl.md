@@ -1,6 +1,9 @@
-# AI_STATUS_WIDGET
+# AI_STATUS_MATRIX
 
 [English](README.md) | **Polski**
+
+<p align="center"><img src="docs/demo.gif" alt="AI Status Matrix – wszystkie stany"></p>
+<p align="center"><sub>Góra: pracuje, bezczynny, czeka · dół: kompaktuje, błąd, brak sesji</sub></p>
 
 Minimalistyczny widget na pulpit Windows, który pokazuje, co robią agenci AI w terminalach.
 Każda sesja (terminal) ma własny kwadratowy ekran w stylu Matrix; siatka rośnie jak tekst w książce:
@@ -15,13 +18,14 @@ Każda sesja (terminal) ma własny kwadratowy ekran w stylu Matrix; siatka rośn
 | magentowy glitch `ERR` | tura skończyła się błędem API albo sesja „pracuje” bez żadnych zdarzeń (zawieszona) |
 | szary szum | brak jakiejkolwiek sesji – agent nie działa albo hooki nie są zainstalowane |
 
+Na listwie u dołu kafelka widać nazwę projektu (folderu terminala) – można ją wyłączyć.
 Kliknięcie w kafelek przełącza do terminala tej sesji, a najechanie pokazuje jej szczegóły.
 Przy krawędzi ekranu widget rośnie w stronę środka.
 
 ## Jak to działa
 
 ```
-Claude Code ──hook──▶ hook.py ──zapis──▶ %LOCALAPPDATA%\ai-traffic-light\sessions\<session_id>.json
+Claude Code ──hook──▶ hook.py ──zapis──▶ %LOCALAPPDATA%\ai-status-matrix\sessions\<session_id>.json
                                                               │
                                    widget.pyw ◀──odczyt co 300 ms
 ```
@@ -76,7 +80,7 @@ Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na
 ## Mapowanie zdarzeń
 
 Narzędzia pomocniczych agentów (subagenci, agent uruchamiany przez hook `Stop`) mają w danych `agent_id`
-i nie zmieniają koloru. Diagnostyka: utwórz pusty plik `%LOCALAPPDATA%\ai-traffic-light\debug`,
+i nie zmieniają koloru. Diagnostyka: utwórz pusty plik `%LOCALAPPDATA%\ai-status-matrix\debug`,
 a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 
 | Zdarzenie | Stan |
@@ -96,21 +100,22 @@ a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 Konfiguracji nie instalujemy automatycznie – przykłady:
 
 - **Gemini CLI** (`~/.gemini/settings.json`, sekcja `hooks`): komenda
-  `python -S D:/tools/ai-traffic-light/hook.py --cli gemini` dla `SessionStart`, `BeforeAgent`,
+  `python -S C:/path/to/AI_STATUS_MATRIX/hook.py --cli gemini` dla `SessionStart`, `BeforeAgent`,
   `BeforeTool`, `AfterAgent`, `PreCompress`, `Notification`, `SessionEnd`.
 - **Codex CLI** (`~/.codex/config.toml`):
-  `notify = ["python", "-S", "D:/tools/ai-traffic-light/hook.py", "--cli", "codex"]`.
+  `notify = ["python", "-S", "C:/path/to/AI_STATUS_MATRIX/hook.py", "--cli", "codex"]`.
   Codex zgłasza tylko koniec tury, więc pokaże bezczynność po skończeniu pracy, ale nie samą pracę.
 
 ## Ustawienia
 
-Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakładki:
+Zapisywane w `%LOCALAPPDATA%\ai-status-matrix\config.json`, podzielone na zakładki:
 
 - **Zachowanie** – warstwa (zawsze na wierzchu / pod oknami), kiedy wyskakiwać, jak długo zostać na wierzchu,
   czas do uznania sesji za zawieszoną, skrót klawiszowy, kliknięcie przełącza do terminala, Nie przeszkadzać.
 - **Dźwięki** – dźwięk przy czekaniu, koniec długiego zadania (próg + dźwięk), przypomnienie o bezczynności
   (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa kafelków (ciemna / jasna / szklana / automatyczna według
-  jasności tła), obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar.
+  jasności tła), obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar
+  (100% = kafelek 60 px), nazwa projektu na kafelku.
 - **System** – język (automatycznie według Windows / polski / angielski), autostart z Windows,
   instalacja/usunięcie hooków, folder stanu.

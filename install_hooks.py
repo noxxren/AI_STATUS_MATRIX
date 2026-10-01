@@ -1,11 +1,11 @@
-"""Dopisuje (albo usuwa) hooki AI Status Widget w ~/.claude/settings.json.
+"""Dopisuje (albo usuwa) hooki AI Status Matrix w ~/.claude/settings.json.
 
     python install_hooks.py              # instalacja (z kopią zapasową settings.json)
     python install_hooks.py --uninstall  # usunięcie tylko naszych wpisów
     python install_hooks.py --dry-run    # pokaż wynik bez zapisu
 
-Nasze wpisy rozpoznajemy po "ai-traffic-light" w komendzie, więc skrypt jest idempotentny
-i nie rusza innych hooków.
+Nasze wpisy rozpoznajemy po ścieżce do hook.py w komendzie (oraz po nazwach folderu sprzed zmiany nazwy
+projektu), więc skrypt jest idempotentny, działa w dowolnym folderze klonu i nie rusza innych hooków.
 """
 import json
 import os
@@ -16,7 +16,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HERE, "hook.py")
 SETTINGS = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-MARK = "ai-traffic-light"
+LEGACY_MARKS = ("ai-traffic-light",)  # wpisy wcześniejszych wersji
 
 # (zdarzenie, matcher albo None)
 EVENTS = [
@@ -43,8 +43,23 @@ def command():
     return f'"{py}" -S "{hook}" --cli claude'
 
 
+def is_ours_command(cmd):
+    cmd = str(cmd).replace("\\", "/").lower()
+    return HOOK.replace("\\", "/").lower() in cmd or any(m in cmd for m in LEGACY_MARKS)
+
+
 def is_ours(group):
-    return any(MARK in str(h.get("command", "")) for h in group.get("hooks", []))
+    return any(is_ours_command(h.get("command", "")) for h in group.get("hooks", []))
+
+
+def installed():
+    """Czy w settings.json są nasze hooki."""
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return any(is_ours(g) for groups in settings.get("hooks", {}).values() for g in groups)
 
 
 def strip(settings):

@@ -1,11 +1,11 @@
-"""AI Status Widget: minimalistyczny widget pokazujący stan agentów AI jako ekrany w stylu Matrix.
+"""AI Status Matrix: minimalistyczny widget pokazujący stan agentów AI jako ekrany w stylu Matrix.
 
 Każda sesja (terminal) ma własny kwadratowy kafelek:
   bezczynny  - kursor `>_`            pracuje      - deszcz znaków
   czeka      - pomarańczowy `?`       kompaktuje   - niebieski skaner (KITT)
   błąd       - glitch `ERR`           brak sesji   - szary szum
 
-Stan sesji zapisuje hook.py do %LOCALAPPDATA%\\ai-traffic-light\\sessions\\*.json.
+Stan sesji zapisuje hook.py do %LOCALAPPDATA%\\ai-status-matrix\\sessions\\*.json.
 Widget czyta te pliki, dodatkowo wykrywa przerwania (Esc) i zamknięte sesje,
 przełącza do terminala agenta i gra dźwięki (bez dymków Windows). Uruchamiaj przez pythonw.
 """
@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 from ctypes import wintypes
@@ -35,7 +36,9 @@ import hook  # noqa: E402
 import install_hooks  # noqa: E402
 import winapi  # noqa: E402
 
-APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-traffic-light")
+LOCAL = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+APP_DIR = os.path.join(LOCAL, "ai-status-matrix")
+LEGACY_APP_DIR = os.path.join(LOCAL, "ai-traffic-light")  # folder stanu sprzed zmiany nazwy projektu
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 MEDIA_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Media")
@@ -79,11 +82,12 @@ DEFAULTS = {
     "idle_remind_minutes": 10,
     "sound_idle": "Windows Notify Calendar.wav",
     # wygląd
-    "scale": 1.25,
+    "size": 1.0,              # rozmiar względem bazowego (100% = BASE_SCALE)
     "opacity": 0.85,
     "housing": "dark",        # "dark" | "light" | "glass" | "auto"
     "state_rim": True,        # obwódka i poświata w kolorze stanu
     "glow": 0.6,              # siła poświaty 0..1
+    "show_names": True,       # nazwa projektu na listwie u dołu kafelka
     # system
     "language": "auto",       # "auto" | "pl" | "en"
     "autostart": False,
@@ -96,7 +100,10 @@ HOUSING = {
     "light": ((246, 247, 249), 255, (0, 0, 0, 36)),
     "glass": ((255, 255, 255), 70, (255, 255, 255, 150)),
 }
-OBSOLETE_KEYS = ("orientation", "show_dots")  # ustawienia usuniętych układów (sygnalizator, korektor…)
+# ustawienia usuniętych układów (sygnalizator, korektor…) i dawna bezwzględna skala zastąpiona przez "size"
+OBSOLETE_KEYS = ("orientation", "show_dots", "scale")
+BASE_SCALE = 1.75  # rozmiar 100%: kafelek 60 px
+SIZES = (0.75, 0.85, 1.0, 1.15, 1.3, 1.5)
 
 HOTKEY_ID = 0xA11
 RADIUS = 2  # zaokrąglenie kafelków
@@ -155,7 +162,7 @@ EN = {
     "Wybierz dźwięk": "Choose sound",
     "Dźwięki (*.wav)": "Sounds (*.wav)",
     # ustawienia
-    "AI Status Widget — ustawienia": "AI Status Widget — settings",
+    "AI Status Matrix — ustawienia": "AI Status Matrix — settings",
     "Pod oknami, wyskakuje przy zmianie": "Below windows, pops up on change",
     "Przy każdej zmianie stanu": "On every state change",
     "Tylko gdy ktoś czeka (pomarańczowe)": "Only when someone is waiting (orange)",
@@ -174,6 +181,7 @@ EN = {
     "Szklana (półprzezroczysta)": "Glass (translucent)",
     "Automatyczna (dopasuj do tła)": "Automatic (match background)",
     "Obwódka i poświata w kolorze aktualnego stanu": "Rim and glow in the current state's color",
+    "Nazwa projektu (terminala) na dole kafelka": "Project (terminal) name at the bottom of the tile",
     "Automatycznie (język systemu)": "Automatic (system language)",
     "Uruchamiaj razem z Windows": "Start with Windows",
     "Otwórz folder stanu": "Open state folder",
@@ -436,28 +444,44 @@ def parse_hotkey(text):
 
 # ---------------------------------------------------------------- system
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "AITrafficLight"
+RUN_NAME = "AIStatusMatrix"
+LEGACY_RUN_NAME = "AITrafficLight"  # sprzed zmiany nazwy
 
 
 def set_autostart(enabled):
+    """Wpis w rejestrze (Run) – przy każdym zapisie z aktualną ścieżką, więc nadąża za przeniesionym folderem."""
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        for name in (LEGACY_RUN_NAME,) + (() if enabled else (RUN_NAME,)):
+            try:
+                winreg.DeleteValue(k, name)
+            except FileNotFoundError:
+                pass
         if enabled:
             exe = sys.executable.replace("python.exe", "pythonw.exe")
             winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, f'"{exe}" "{os.path.abspath(__file__)}"')
-        else:
-            try:
-                winreg.DeleteValue(k, RUN_NAME)
-            except FileNotFoundError:
-                pass
+
+
+def migrate_app_dir():
+    """Przenosi konfigurację i sesje ze starego folderu stanu (ai-traffic-light). Pliki już istniejące w nowym
+    folderze wygrywają – mógł je założyć hook nowej wersji, zanim widget wystartował."""
+    if not os.path.isdir(LEGACY_APP_DIR):
+        return
+    for root, _dirs, files in os.walk(LEGACY_APP_DIR):
+        target_dir = os.path.join(APP_DIR, os.path.relpath(root, LEGACY_APP_DIR))
+        os.makedirs(target_dir, exist_ok=True)
+        for name in files:
+            target = os.path.join(target_dir, name)
+            if name != "widget.lock" and not os.path.exists(target):
+                try:
+                    os.replace(os.path.join(root, name), target)
+                except OSError:
+                    pass
+    shutil.rmtree(LEGACY_APP_DIR, ignore_errors=True)
 
 
 def hooks_installed():
-    try:
-        with open(install_hooks.SETTINGS, encoding="utf-8") as f:
-            return install_hooks.MARK in f.read()
-    except OSError:
-        return False
+    return install_hooks.installed()
 
 
 def in_quiet_hours(cfg):
@@ -469,13 +493,43 @@ def in_quiet_hours(cfg):
 
 
 # ---------------------------------------------------------------- the widget
+@functools.lru_cache(maxsize=96)
+def halo_pixmap(tile, s, rgb, pulse, glow, dpr):
+    """(obrazek, margines): cień i poświata jednego kafelka. Poświata ma warstwy co ~2,5 px niezależnie
+    od rozmiaru, więc przy dużym widgecie nie rozpada się na pasy."""
+    reach = 14 * s
+    pad = math.ceil(reach) + 5
+    size = tile + 2 * pad
+    pm = QPixmap(round(size * dpr), round(size * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    rect = QRectF(pad, pad, tile, tile)
+    for i, a in enumerate((18, 12, 7)):
+        p.setBrush(QColor(0, 0, 0, a))
+        p.drawRoundedRect(rect.adjusted(-i - 1, -i + 2, i + 1, i + 4), RADIUS + i, RADIUS + i)
+    if glow > 0:
+        layers = max(7, round(reach / 2.5))
+        c = QColor.fromRgb(rgb)
+        for i in range(layers, 0, -1):
+            grow = i * reach / layers
+            c.setAlphaF(min(1.0, 0.16 * 7 / layers * glow * pulse * (1 - (i - 1) / layers)))
+            p.setBrush(c)
+            p.drawRoundedRect(rect.adjusted(-grow, -grow, grow, grow), RADIUS + grow, RADIUS + grow)
+    p.end()
+    return pm, pad
+
+
+
 class Light(QWidget):
     def __init__(self, cfg):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_AlwaysShowToolTips)
-        self.setWindowTitle("AI Status Widget")
+        self.setWindowTitle("AI Status Matrix")
 
         self.cfg = cfg
         self.sessions = load_sessions(cfg)
@@ -513,8 +567,9 @@ class Light(QWidget):
     # ---- geometry
     def dims(self):
         """Siatka kafelków: jeden na sesję, rośnie 1, 2×1, 2×2, 3×2, 3×3…"""
-        s = self.cfg["scale"]
-        tile, gap, margin = 34 * s, 3 * s, 16 * s
+        s = self.cfg["size"] * BASE_SCALE
+        # pełne piksele: krawędzie kafelków nie wypadają na połówkach pikseli, więc nie są rozmyte
+        tile, gap, margin = round(34 * s), max(2, round(3 * s)), round(16 * s)
         n = max(1, len(self.sessions))
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
@@ -580,7 +635,7 @@ class Light(QWidget):
         changed = new != self.state
         self.state = new
         self.setToolTip(self.tooltip_text())
-        self.tray.setToolTip("AI Status Widget: " + self.caption())
+        self.tray.setToolTip("AI Status Matrix: " + self.caption())
         icon_key = (new, self.cfg["dnd_manual"])
         if icon_key != self._icon_key:  # podmiana ikony w zasobniku jest kosztowna – tylko przy zmianie
             self._icon_key = icon_key
@@ -840,6 +895,7 @@ class Light(QWidget):
     def paintEvent(self, _):
         g = self.dims()
         tiles = [(rect, self.tile_state(sess)) for rect, sess in self.tiles(g)]
+        names = [(sess or {}).get("project", "") if self.cfg["show_names"] else "" for _, sess in self.tiles(g)]
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         now = time.monotonic()
@@ -863,27 +919,17 @@ class Light(QWidget):
         bg_rgb, bg_alpha, border = HOUSING[self.housing()]
         bg = QColor(*bg_rgb, int(bg_alpha * self.cfg["opacity"]))
 
-        # cień
-        p.setPen(Qt.NoPen)
-        for rect, _ in tiles:
-            for i, a in enumerate((18, 12, 7)):
-                p.setBrush(QColor(0, 0, 0, a))
-                p.drawRoundedRect(rect.adjusted(-i - 1, -i + 2, i + 1, i + 4), RADIUS + i, RADIUS + i)
-
-        # poświata dookoła każdego kafelka w kolorze jego stanu
+        # cień i poświata w kolorze stanu: gotowe obrazki z pamięci podręcznej zamiast kilkunastu warstw na klatkę
         pulses = [self._pulse(st, now, breathe) for _, st in tiles]
-        if rim and self.cfg["glow"] > 0:
-            layers = 7
-            for (rect, st), pulse in zip(tiles, pulses):
-                c = QColor(COLOR[st])
-                for i in range(layers, 0, -1):
-                    grow = i * 2 * g["s"]
-                    c.setAlphaF(min(1.0, 0.16 * self.cfg["glow"] * pulse * (1 - (i - 1) / layers)))
-                    p.setBrush(c)
-                    p.drawRoundedRect(rect.adjusted(-grow, -grow, grow, grow), RADIUS + grow, RADIUS + grow)
+        glow = self.cfg["glow"] if rim else 0
+        dpr = self.devicePixelRatioF()
+        for (rect, st), pulse in zip(tiles, pulses):
+            pm, pad = halo_pixmap(round(rect.width()), g["s"], COLOR[st].rgb() if glow else 0,
+                                  round(pulse * 20) / 20, glow, dpr)
+            p.drawPixmap(QPointF(rect.left() - pad, rect.top() - pad), pm)
 
         # kafelki: obudowa z obwódką w kolorze stanu i ekran Matrix
-        for (rect, st), pulse in zip(tiles, pulses):
+        for (rect, st), pulse, name in zip(tiles, pulses, names):
             if rim:
                 c = QColor(COLOR[st])
                 c.setAlphaF(0.55 + 0.35 * pulse)
@@ -892,7 +938,7 @@ class Light(QWidget):
                 p.setPen(QPen(QColor(*border), 1))
             p.setBrush(bg)
             p.drawRoundedRect(rect, RADIUS, RADIUS)
-            self._paint_screen(p, rect, g["s"], now, breathe, st)
+            self._paint_screen(p, rect, g["s"], now, breathe, st, name)
 
         # poświata przy wyskoczeniu
         if 0 <= t < 1.2:
@@ -919,11 +965,23 @@ class Light(QWidget):
             return OFFLINE
         return ERROR if sess["state"] == STALE else sess["state"]
 
-    def _paint_screen(self, p, tile, s, now, breathe, st):
+    def _paint_screen(self, p, tile, s, now, breathe, st, name=""):
         """Ekran kafelka: kursor `>_` (bezczynny), deszcz znaków (pracuje), glitchujący `?` (czeka),
-        skaner KITT (kompaktuje), zakłócony obraz z `ERR` (błąd albo zawieszona sesja), szum (brak sesji)."""
+        skaner KITT (kompaktuje), zakłócony obraz z `ERR` (błąd albo zawieszona sesja), szum (brak sesji).
+        Z nazwą projektu ekran jest niższy, a pod nim listwa z nazwą – jak tabliczka na monitorze."""
         col = COLOR[st]
-        screen = tile.adjusted(2 * s, 2 * s, -2 * s, -2 * s)
+        inset = round(2 * s)
+        strip = round(7 * s) if name else 0
+        screen = tile.adjusted(inset, inset, -inset, -inset - strip)
+        if name:
+            p.save()
+            p.setFont(self._label_font(4.4 * s))
+            c = QColor(col)
+            c.setAlphaF(0.9)
+            p.setPen(c)
+            label = QRectF(tile.left() + inset, screen.bottom(), tile.width() - 2 * inset, strip + inset * 0.5)
+            p.drawText(label, Qt.AlignCenter, p.fontMetrics().elidedText(name, Qt.ElideRight, int(label.width())))
+            p.restore()
         p.save()
         clip = QPainterPath()
         clip.addRoundedRect(screen, RADIUS, RADIUS)
@@ -940,10 +998,10 @@ class Light(QWidget):
             self._paint_rain(p, screen, s, now, col)
         elif st == WAITING:
             glitch = (now * 2.3) % 1 < 0.12  # na moment rozszczepienie na cyjan i magentę
-            self._paint_glyph(p, screen, s, "?", col, 11 * s, Qt.AlignCenter, glitch)
+            self._paint_glyph(p, screen, s, "?", col, 14 * s, Qt.AlignCenter, glitch)
         elif st == IDLE:  # znak zachęty w lewym dolnym rogu, jak w terminalu
             prompt = screen.adjusted(2.5 * s, 2 * s, -2 * s, -1.5 * s)
-            self._paint_glyph(p, prompt, s, ">_" if int(now * 2) % 2 else ">", col, 7 * s, Qt.AlignLeft | Qt.AlignBottom)
+            self._paint_glyph(p, prompt, s, ">_" if int(now * 2) % 2 else ">", col, 8 * s, Qt.AlignLeft | Qt.AlignBottom)
         p.fillRect(screen, self._scanlines(s))  # linie skanowania jak na monitorze kineskopowym
         p.restore()
 
@@ -1004,15 +1062,27 @@ class Light(QWidget):
             p.fillRect(QRectF(rect.left() + rnd.uniform(0, rect.width() - w), rnd.uniform(rect.top(), rect.bottom()),
                               w, rnd.uniform(0.6, 2.5) * s), q)
         shift = rnd.uniform(-2, 2) * s if rnd.random() < 0.5 else 0
-        self._paint_glyph(p, rect.translated(shift, 0), s, "ERR", GLITCH, 8 * s, Qt.AlignCenter, glitch=True)
+        self._paint_glyph(p, rect.translated(shift, 0), s, "ERR", GLITCH, 9.5 * s, Qt.AlignCenter, glitch=True)
 
     RAIN_GLYPHS = "01アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモ"
 
     @staticmethod
     @functools.lru_cache(maxsize=16)
     def _font(px):
-        font = QFont("MS Gothic")
-        font.setPixelSize(max(6, int(px)))
+        """Wygładzana czcionka ekranu: łacina z Consolas, katakana z Yu Gothic UI. MS Gothic w małych rozmiarach
+        rysuje znaki z gotowych bitmap, więc przy większym widgecie wyglądały jak schodki."""
+        font = QFont("Consolas")
+        font.setFamilies(["Consolas", "Yu Gothic UI", "MS Gothic"])
+        font.setPixelSize(max(6, round(px)))
+        font.setBold(True)
+        font.setStyleStrategy(QFont.PreferAntialias)
+        return font
+
+    @staticmethod
+    @functools.lru_cache(maxsize=8)
+    def _label_font(px):
+        font = QFont("Segoe UI")
+        font.setPixelSize(max(7, round(px)))
         font.setBold(True)
         return font
 
@@ -1144,7 +1214,7 @@ class Light(QWidget):
     # ---- menu
     def fill_menu(self, menu):
         menu.clear()
-        head = menu.addAction(f"AI Status Widget · {self.caption()}")
+        head = menu.addAction(f"AI Status Matrix · {self.caption()}")
         head.setEnabled(False)
 
         target = self.attention_session()
@@ -1234,7 +1304,7 @@ class Light(QWidget):
         self.apply_appearance()
 
 
-APPEARANCE_KEYS = ("housing", "state_rim", "glow", "opacity", "scale")
+APPEARANCE_KEYS = ("housing", "state_rim", "glow", "opacity", "size", "show_names")
 
 # nazwa -> (obudowa, obwódka w kolorze stanu)
 STYLE_PRESETS = [
@@ -1305,7 +1375,7 @@ class SoundPicker(QWidget):
 class SettingsDialog(QDialog):
     def __init__(self, cfg, on_preview=None):
         super().__init__(None, Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.setWindowTitle(T("AI Status Widget — ustawienia"))
+        self.setWindowTitle(T("AI Status Matrix — ustawienia"))
         self.setMinimumWidth(540)
         self._on_preview = on_preview
         self._loading = True
@@ -1360,13 +1430,14 @@ class SettingsDialog(QDialog):
         self.housing.addItem(T("Szklana (półprzezroczysta)"), "glass")
         self.housing.addItem(T("Automatyczna (dopasuj do tła)"), "auto")
         self.state_rim = QCheckBox(T("Obwódka i poświata w kolorze aktualnego stanu"))
+        self.show_names = QCheckBox(T("Nazwa projektu (terminala) na dole kafelka"))
         self.glow = QSlider(Qt.Horizontal, minimum=0, maximum=100)
         self.glow_lbl = QLabel()
         self.opacity = QSlider(Qt.Horizontal, minimum=30, maximum=100)
         self.opacity_lbl = QLabel()
         self.scale = QComboBox()
-        for v in (1.0, 1.25, 1.5, 2.0, 2.5):
-            self.scale.addItem(f"{int(v * 100)}%", v)
+        for v in SIZES:
+            self.scale.addItem(f"{round(v * 100)}%", v)
 
         # --- System
         self.autostart = QCheckBox(T("Uruchamiaj razem z Windows"))
@@ -1382,7 +1453,7 @@ class SettingsDialog(QDialog):
         open_dir.clicked.connect(lambda: (os.makedirs(SESSIONS_DIR, exist_ok=True), os.startfile(APP_DIR)))
 
         # --- wartości początkowe
-        for combo, key in ((self.mode, "mode"), (self.pop_rule, "pop_rule"), (self.scale, "scale"),
+        for combo, key in ((self.mode, "mode"), (self.pop_rule, "pop_rule"), (self.scale, "size"),
                            (self.housing, "housing"), (self.language, "language")):
             combo.setCurrentIndex(max(combo.findData(cfg[key]), 0))
         self.pop_seconds.setValue(int(cfg["pop_seconds"]))
@@ -1402,6 +1473,7 @@ class SettingsDialog(QDialog):
         self.idle_minutes.setEnabled(cfg["idle_remind"])
         self.sound_idle.setEnabled(cfg["idle_remind"])
         self.state_rim.setChecked(cfg["state_rim"])
+        self.show_names.setChecked(cfg["show_names"])
         self.glow.setValue(int(cfg["glow"] * 100))
         self.opacity.setValue(int(cfg["opacity"] * 100))
         self.autostart.setChecked(cfg["autostart"])
@@ -1464,6 +1536,7 @@ class SettingsDialog(QDialog):
             ("Krycie tła", self._with_label(self.opacity, self.opacity_lbl)),
             None,
             ("Rozmiar", self.scale),
+            ("", self.show_names),
         ], "Zmiany widać od razu na widgecie, a Anuluj przywraca poprzedni wygląd. "
            "Obudowa automatyczna co 1,5 s sprawdza jasność tła i wybiera jasne albo ciemne kafelki."), T("Wygląd"))
         hk_w = QWidget()
@@ -1497,6 +1570,7 @@ class SettingsDialog(QDialog):
         for w in (self.housing, self.scale):
             w.currentIndexChanged.connect(self._changed)
         self.state_rim.toggled.connect(self._changed)
+        self.show_names.toggled.connect(self._changed)
         for w in (self.glow, self.opacity):
             w.valueChanged.connect(self._changed)
         self._loading = False
@@ -1619,9 +1693,10 @@ class SettingsDialog(QDialog):
             "sound_idle": self.sound_idle.value(),
             "housing": self.housing.currentData(),
             "state_rim": self.state_rim.isChecked(),
+            "show_names": self.show_names.isChecked(),
             "glow": self.glow.value() / 100,
             "opacity": self.opacity.value() / 100,
-            "scale": self.scale.currentData(),
+            "size": self.scale.currentData(),
             "autostart": self.autostart.isChecked(),
             "language": self.language.currentData(),
         }
@@ -1663,6 +1738,7 @@ QSlider::handle:horizontal { width: 14px; margin: -5px 0; background: #E6EDF2; b
 
 
 def main():
+    migrate_app_dir()
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     lock = QLockFile(os.path.join(APP_DIR, "widget.lock"))
     if not lock.tryLock(100):
@@ -1672,6 +1748,11 @@ def main():
     app.setStyleSheet(STYLE)
     cfg = load_config()
     set_language(cfg)
+    if cfg["autostart"]:
+        try:
+            set_autostart(True)  # odśwież wpis: nowa nazwa projektu, aktualna ścieżka
+        except OSError:
+            pass
     w = Light(cfg)
     w.show()
     w.apply_layer()

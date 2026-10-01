@@ -1,4 +1,4 @@
-"""Cienka warstwa WinAPI (ctypes) dla AI Status Widget.
+"""Cienka warstwa WinAPI (ctypes) dla AI Status Matrix.
 
 Tylko biblioteka standardowa: moduł importuje zarówno widget, jak i hook.py
 (hook potrzebuje `find_agent_process` i `process_created`).

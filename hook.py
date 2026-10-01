@@ -1,8 +1,8 @@
-"""Hook dla AI Status Widget.
+"""Hook dla AI Status Matrix.
 
 Wywoływany przez CLI agenta (Claude Code, Gemini CLI, Codex CLI) przy każdym zdarzeniu.
 Czyta JSON zdarzenia (stdin albo ostatni argument), wylicza stan sesji i zapisuje go do
-%LOCALAPPDATA%\\ai-traffic-light\\sessions\\<session_id>.json. Widget tylko czyta te pliki.
+%LOCALAPPDATA%\\ai-status-matrix\\sessions\\<session_id>.json. Widget tylko czyta te pliki.
 
 Zasady: tylko biblioteka standardowa, zero wypisywania na stdout, zawsze exit 0.
 Hook nie może nigdy zablokować ani spowolnić agenta.
@@ -17,7 +17,7 @@ import sys
 import time
 
 STATE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-traffic-light", "sessions"
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ai-status-matrix", "sessions"
 )
 
 IDLE, WORKING, WAITING, ERROR, END = "idle", "working", "waiting", "error", "end"
@@ -208,7 +208,7 @@ def question_of(text):
 
 
 def debug_log(cli, event, data):
-    """Diagnostyka: gdy istnieje plik ...\\ai-traffic-light\\debug, dopisz surowe zdarzenie do debug.log."""
+    """Diagnostyka: gdy istnieje plik ...\\ai-status-matrix\\debug, dopisz surowe zdarzenie do debug.log."""
     base = os.path.dirname(STATE_DIR)
     if not os.path.exists(os.path.join(base, "debug")):
         return
