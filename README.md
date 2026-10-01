@@ -51,7 +51,8 @@ Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na
 ## Co jeszcze robi widget
 
 - **Przejście do terminala** – hook zapisuje PID procesu agenta (`claude.exe`), a widget idzie w górę drzewa
-  procesów aż do okna terminala (Warp, Windows Terminal, VS Code…). Skrót globalny domyślnie `Ctrl+Alt+L`.
+  procesów aż do okna terminala (Warp, Windows Terminal, VS Code…). Opcjonalny skrót globalny (domyślnie wyłączony,
+  ustawisz go w Ustawienia → Zachowanie → Skrót do agenta, np. `Ctrl+Alt+L`).
   W terminalach z kartami przełącza do okna, nie do konkretnej karty.
 - **Przerwanie (Esc)** – co ~2 s widget sprawdza koniec zapisu rozmowy (`transcript_path`); wpis
   „Request interrupted by user” od razu przestawia sesję na bezczynną.
@@ -98,5 +99,5 @@ Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakła
 - **Dźwięki** – dźwięk przy czekaniu, koniec długiego zadania (próg + dźwięk), przypomnienie o bezczynności
   (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa (ciemna / jasna / szklana / automatyczna według jasności tła),
-  obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ, kropki sesji.
+  obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ (pionowy / poziomy / jedno światło zmieniające kolor), kropki sesji.
 - **System** – autostart z Windows, instalacja/usunięcie hooków, folder stanu.

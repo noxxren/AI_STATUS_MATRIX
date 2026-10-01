@@ -51,7 +51,7 @@ DEFAULTS = {
     "pop_seconds": 5,         # 0 = zostaje na wierzchu do kliknięcia
     "stale_minutes": 10,
     "forget_hours": 12,
-    "hotkey": "Ctrl+Alt+L",   # przejdź do czekającego agenta; "" = wyłączony
+    "hotkey": "",             # przejdź do czekającego agenta; "" = wyłączony
     "click_jumps": True,      # kliknięcie w sygnalizator przełącza do czekającego terminala
     "question_waiting": True,  # odpowiedź zakończona pytaniem = czeka na Ciebie (pomarańczowe)
     # nie przeszkadzać
@@ -344,7 +344,12 @@ class Light(QWidget):
         s = self.cfg["scale"]
         d, gap, pad, margin = 14 * s, 6 * s, 7 * s, 16 * s
         long_side, short_side = 3 * d + 2 * gap + 2 * pad, d + 2 * pad
-        cw, ch = (short_side, long_side) if self.cfg["orientation"] == "vertical" else (long_side, short_side)
+        if self.cfg["orientation"] == "single":
+            cw = ch = 20 * s + 2 * pad  # jedno światło w okrągłej obudowie, z szerszym marginesem
+        elif self.cfg["orientation"] == "vertical":
+            cw, ch = short_side, long_side
+        else:
+            cw, ch = long_side, short_side
         dot, dgap, dtop = 4 * s, 3 * s, 5 * s
         n = len(self.sessions) if self.cfg["show_dots"] else 0
         dots_w = n * dot + max(n - 1, 0) * dgap
@@ -692,9 +697,12 @@ class Light(QWidget):
             p.drawPath(ring)
 
         # lampy
-        for i, st in enumerate((WORKING, WAITING, IDLE)):
+        single = self.cfg["orientation"] == "single"
+        for i, st in enumerate((self.state,) if single else (WORKING, WAITING, IDLE)):
             off = g["pad"] + i * (g["d"] + g["gap"]) + g["d"] / 2
-            if self.cfg["orientation"] == "vertical":
+            if single:
+                c = body.center()
+            elif self.cfg["orientation"] == "vertical":
                 c = QPointF(body.center().x(), body.top() + off)
             else:
                 c = QPointF(body.left() + off, body.center().y())
@@ -1013,6 +1021,7 @@ class SettingsDialog(QDialog):
         self.orientation = QComboBox()
         self.orientation.addItem("Pionowy", "vertical")
         self.orientation.addItem("Poziomy", "horizontal")
+        self.orientation.addItem("Jedno światło (zmienia kolor)", "single")
         self.show_dots = QCheckBox("Pokazuj kropki sesji pod sygnalizatorem")
 
         # --- System
