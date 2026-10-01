@@ -90,6 +90,9 @@ HOUSING = {
 
 HOTKEY_ID = 0xA11
 
+# układy rysowane zamiast lamp; przy pracy animują się bez przerwy
+MOVING_LAYOUTS = ("ring", "eq")
+
 
 # ---------------------------------------------------------------- config & sessions
 def load_config():
@@ -344,9 +347,12 @@ class Light(QWidget):
         s = self.cfg["scale"]
         d, gap, pad, margin = 14 * s, 6 * s, 7 * s, 16 * s
         long_side, short_side = 3 * d + 2 * gap + 2 * pad, d + 2 * pad
-        if self.cfg["orientation"] == "single":
-            cw = ch = 20 * s + 2 * pad  # jedno światło w okrągłej obudowie, z szerszym marginesem
-        elif self.cfg["orientation"] == "vertical":
+        layout = self.cfg["orientation"]
+        if layout in ("single", "ring"):
+            cw = ch = 20 * s + 2 * pad  # okrągła obudowa
+        elif layout == "eq":
+            cw, ch = 29 * s + 2 * pad, 20 * s + 2 * pad
+        elif layout == "vertical":
             cw, ch = short_side, long_side
         else:
             cw, ch = long_side, short_side
@@ -619,7 +625,8 @@ class Light(QWidget):
 
     # ---- animation
     def _animating(self):
-        return self.state == WAITING or time.monotonic() - self._pop_t0 < 1.2
+        moving = self.cfg["orientation"] in MOVING_LAYOUTS and self.state == WORKING
+        return moving or self.state == WAITING or time.monotonic() - self._pop_t0 < 1.2
 
     def _sync_anim(self):
         if self._animating():
@@ -696,9 +703,16 @@ class Light(QWidget):
             p.setPen(QPen(QColor(255, 255, 255, int(150 * (1 - k))), 2 * g["s"]))
             p.drawPath(ring)
 
+        layout = self.cfg["orientation"]
+        if layout == "ring":
+            self._paint_ring(p, body, g, now, breathe, lamp_off)
+        elif layout == "eq":
+            self._paint_eq(p, body, g, now, lamp_off)
+
         # lampy
-        single = self.cfg["orientation"] == "single"
-        for i, st in enumerate((self.state,) if single else (WORKING, WAITING, IDLE)):
+        single = layout == "single"
+        lamps = () if layout in MOVING_LAYOUTS else (self.state,) if single else (WORKING, WAITING, IDLE)
+        for i, st in enumerate(lamps):
             off = g["pad"] + i * (g["d"] + g["gap"]) + g["d"] / 2
             if single:
                 c = body.center()
@@ -730,6 +744,74 @@ class Light(QWidget):
             p.setBrush(DOT_COLOR.get(s["state"], GREY))
             p.drawEllipse(c, g["dot"] / 2, g["dot"] / 2)
         p.end()
+
+    @staticmethod
+    def _ring_geometry(body, g):
+        """Środek, promień i grubość pierścienia w okrągłej obudowie."""
+        width = 3.2 * g["s"]
+        return body.center(), body.width() / 2 - g["pad"] + width / 2, width
+
+    @staticmethod
+    def _arc(p, c, r, color, width, start_deg, span_deg):
+        """Łuk od start_deg (0 = góra) zgodnie z ruchem wskazówek zegara."""
+        pen = QPen(color, width)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), int((90 - start_deg) * 16), int(-span_deg * 16))
+
+    def _center_glow(self, p, c, r, color, alpha):
+        grad = QRadialGradient(c, r)
+        gc = QColor(color)
+        gc.setAlphaF(alpha)
+        grad.setColorAt(0, gc)
+        gc.setAlphaF(0)
+        grad.setColorAt(1, gc)
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawEllipse(c, r, r)
+
+    def _paint_ring(self, p, body, g, now, breathe, lamp_off):
+        """Pierścień: pełny i spokojny (bezczynny), obracający się łuk z ogonem (pracuje), pulsujący (czeka)."""
+        c, r, width = self._ring_geometry(body, g)
+        col = QColor(LAMP_COLOR[self.state])
+        self._arc(p, c, r, QColor(*lamp_off), width, 0, 360)
+        if self.state == WORKING:
+            head = (now * 300) % 360  # stopnie; ~1,2 s na obrót
+            for i in range(8):  # ogon: coraz słabsze odcinki za głową łuku
+                seg = QColor(col)
+                seg.setAlphaF(1 - i / 8)
+                self._arc(p, c, r, seg, width, head - (i + 1) * 14, 14.5)
+        else:
+            a = breathe if self.state == WAITING else 0.9
+            col.setAlphaF(a)
+            self._arc(p, c, r, col, width * (1.15 if self.state == WAITING else 1), 0, 360)
+        self._center_glow(p, c, r * 0.75, LAMP_COLOR[self.state], 0.35 * (breathe if self.state == WAITING else 0.8))
+
+    def _paint_eq(self, p, body, g, now, lamp_off):
+        """Korektor: niskie, nieruchome słupki (bezczynny), tańczące (pracuje), podskakujące razem (czeka)."""
+        s = g["s"]
+        bars, bw, gap = 5, 3.4 * s, 2.5 * s
+        top, bottom = body.top() + g["pad"], body.bottom() - g["pad"]
+        full = bottom - top
+        x0 = body.center().x() - (bars * bw + (bars - 1) * gap) / 2
+        col = QColor(LAMP_COLOR[self.state])
+        shape = (0.6, 0.8, 1.0, 0.8, 0.6)
+        bounce = abs(math.sin(now * math.pi * 1.25))
+        p.setPen(Qt.NoPen)
+        for i in range(bars):
+            x = x0 + i * (bw + gap)
+            p.setBrush(QColor(*lamp_off))
+            p.drawRoundedRect(QRectF(x, top, bw, full), bw / 2, bw / 2)
+            if self.state == WORKING:
+                level = 0.55 + 0.25 * math.sin(now * 7.3 + i * 1.9) + 0.2 * math.sin(now * 4.1 * (1 + i * 0.17) + i)
+            elif self.state == WAITING:
+                level = (0.3 + 0.7 * bounce) * shape[i]
+            else:
+                level = 0.22 + 0.08 * shape[i]
+            h = max(bw, full * min(1.0, max(0.12, level)))
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(x, bottom - h, bw, h), bw / 2, bw / 2)
 
     def tray_icon(self):
         pm = QPixmap(32, 32)
@@ -1022,6 +1104,8 @@ class SettingsDialog(QDialog):
         self.orientation.addItem("Pionowy", "vertical")
         self.orientation.addItem("Poziomy", "horizontal")
         self.orientation.addItem("Jedno światło (zmienia kolor)", "single")
+        self.orientation.addItem("Pierścień (obraca się przy pracy)", "ring")
+        self.orientation.addItem("Korektor (słupki)", "eq")
         self.show_dots = QCheckBox("Pokazuj kropki sesji pod sygnalizatorem")
 
         # --- System

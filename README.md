@@ -99,5 +99,7 @@ Zapisywane w `%LOCALAPPDATA%\ai-traffic-light\config.json`, podzielone na zakła
 - **Dźwięki** – dźwięk przy czekaniu, koniec długiego zadania (próg + dźwięk), przypomnienie o bezczynności
   (czas + dźwięk). Dźwięki z `C:\Windows\Media` albo własny plik `.wav`, przycisk ▶ odtwarza wybrany.
 - **Wygląd** (podgląd na żywo) – gotowy styl, obudowa (ciemna / jasna / szklana / automatyczna według jasności tła),
-  obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ (pionowy / poziomy / jedno światło zmieniające kolor), kropki sesji.
+  obwódka i poświata w kolorze stanu (domyślnie włączona), siła poświaty, krycie tła, rozmiar, układ, kropki sesji.
+  Układy: sygnalizator pionowy / poziomy, jedno światło zmieniające kolor, **pierścień** (przy pracy obraca się łuk)
+  i **korektor** (słupki: nieruchome, tańczące przy pracy, podskakujące razem, gdy ktoś czeka).
 - **System** – autostart z Windows, instalacja/usunięcie hooków, folder stanu.
