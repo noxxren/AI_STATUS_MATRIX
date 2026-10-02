@@ -15,6 +15,7 @@ Each session (terminal) gets its own square Matrix-style screen; the grid grows 
 | green falling characters | agent is working |
 | orange, pulsing `?` | agent is waiting for your reply |
 | blue KITT-style scanner (“Knight Rider”) | agent is compacting the conversation context (`/compact` or automatic) |
+| `>_` cursor over a faint, slow character rain + three red dots | the agent finished its turn, but its background task (command, helper agent) is still running |
 | magenta `ERR` glitch | the turn ended with an API error, or the session is “working” with no events (stalled) |
 | grey noise | no sessions at all – the agent is not running or the hooks are not installed |
 
@@ -73,6 +74,8 @@ The tray icon has the same menu; clicking it brings the widget to the front.
   connection) switches the session to error. The hook checks this on `Stop`, and the widget every ~2 s, because
   `Stop` does not always arrive after an error. The next prompt sent to the agent clears the error.
 - **Closed terminal** – a session whose agent process is gone disappears right away (PID + process creation time).
+- **Background tasks** – a command or helper agent started with `run_in_background` is tracked until Claude Code
+  reports it finished (`<task-notification>`) or it is stopped (`TaskStop`); the tooltip lists them with their run time.
 - **Timers** – in the tooltip and menu: how long a session has been working / waiting / idle.
 - **Sounds** – when someone is waiting, when the agent finishes a task longer than a threshold (3 min by default),
   and when a session has been idle for N minutes (10 by default). The widget deliberately shows no Windows
@@ -95,6 +98,8 @@ and the hook will append raw events to `debug.log` in the same folder.
 | `Stop` (or its absence), when the turn ended with an API error | error |
 | `PreCompact` | compacting; the following `SessionStart` (`source: compact`) returns to working (auto) or idle (`/compact`) |
 | `Notification` (`idle_prompt` and other informational ones) | no change |
+| `PostToolUse` with `run_in_background` (task id in the response) | background task starts; after `Stop` the tile shows “background task” |
+| `UserPromptSubmit` with `<task-notification>` (task id) | background task finished – removed from the list |
 | `SessionEnd` | session disappears |
 
 ## Other CLIs

@@ -15,6 +15,7 @@ Każda sesja (terminal) ma własny kwadratowy ekran w stylu Matrix; siatka rośn
 | zielony deszcz znaków | agent pracuje |
 | pomarańczowy, pulsujący `?` | agent czeka na Twoją odpowiedź |
 | niebieski skaner jak KITT z „Knight Ridera” | agent kompaktuje kontekst rozmowy (`/compact` albo automatycznie) |
+| kursor `>_` na tle przygaszonego, wolnego deszczu znaków + trzy czerwone kropki | agent skończył turę, ale jego zadanie w tle (komenda, pomocniczy agent) jeszcze trwa |
 | magentowy glitch `ERR` | tura skończyła się błędem API albo sesja „pracuje” bez żadnych zdarzeń (zawieszona) |
 | szary szum | brak jakiejkolwiek sesji – agent nie działa albo hooki nie są zainstalowane |
 
@@ -71,6 +72,8 @@ Ikona w zasobniku systemowym ma to samo menu; kliknięcie jej wyciąga widget na
   przestawia sesję na błąd. Sprawdza to hook przy `Stop` i widget co ~2 s, bo po błędzie `Stop` nie zawsze przychodzi.
   Kolejne polecenie wysłane do agenta kasuje błąd.
 - **Zamknięty terminal** – sesja, której proces agenta już nie żyje, znika od razu (PID + czas utworzenia procesu).
+- **Zadania w tle** – komenda albo pomocniczy agent uruchomiony z `run_in_background` jest śledzony, aż Claude Code
+  zgłosi jego koniec (`<task-notification>`) albo zostanie zatrzymany (`TaskStop`); podpowiedź pokazuje je z czasem trwania.
 - **Liczniki** – w podpowiedzi i menu: jak długo sesja pracuje / czeka / jest bezczynna.
 - **Dźwięki** – gdy ktoś czeka, gdy agent skończy zadanie dłuższe niż próg (domyślnie 3 min) i gdy sesja
   jest bezczynna od N minut (domyślnie 10). Widget celowo nie pokazuje dymków ani powiadomień Windows.
@@ -92,6 +95,8 @@ a hook zacznie dopisywać surowe zdarzenia do `debug.log` w tym samym folderze.
 | `Stop` (albo jego brak), gdy tura skończyła się błędem API | błąd |
 | `PreCompact` | kompaktuje; po nim `SessionStart` (`source: compact`) wraca do pracy (auto) albo bezczynności (`/compact`) |
 | `Notification` (`idle_prompt` i inne informacyjne) | bez zmiany |
+| `PostToolUse` z `run_in_background` (identyfikator zadania w odpowiedzi) | start zadania w tle; po `Stop` kafelek pokazuje „zadanie w tle” |
+| `UserPromptSubmit` z `<task-notification>` (identyfikator zadania) | zadanie w tle skończone – znika z listy |
 | `SessionEnd` | sesja znika |
 
 ## Inne CLI

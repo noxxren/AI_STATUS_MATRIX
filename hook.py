@@ -89,6 +89,40 @@ def notification_state(data):
 
 TOOL_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "BeforeTool", "AfterTool"}
 
+# ---------------------------------------------------------------- zadania w tle
+# Start: PostToolUse z "run_in_background" w wejściu i identyfikatorem zadania w odpowiedzi narzędzia.
+# Koniec: Claude Code budzi agenta wiadomością <task-notification><task-id>…</task-id>…, która przychodzi
+# jako UserPromptSubmit. Zatrzymanie ręczne: narzędzie TaskStop / KillShell.
+BG_ID_KEYS = ("backgroundTaskId", "taskId", "task_id", "agentId", "shellId", "bash_id")
+STOP_TOOLS = {"TaskStop", "KillShell", "KillBash"}
+_TASK_ID = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+
+
+def background_tasks(event, data, prev):
+    """Lista zadań w tle sesji: [{"id", "label", "started"}]."""
+    tasks = [t for t in prev.get("background") or [] if isinstance(t, dict) and t.get("id")]
+    if data.get("agent_id"):
+        return tasks  # zadania pomocniczych agentów nie są zadaniami tej sesji
+    if event == "SessionStart" and data.get("source") in ("startup", "resume"):
+        return []  # nowy proces Claude Code – zadania poprzedniego już nie żyją
+    if event == "UserPromptSubmit":
+        done = set(_TASK_ID.findall(str(data.get("prompt") or "")))
+        return [t for t in tasks if t["id"] not in done]
+    if event != "PostToolUse":
+        return tasks
+    inp, resp = data.get("tool_input"), data.get("tool_response")
+    if not isinstance(inp, dict):
+        return tasks
+    if data.get("tool_name") in STOP_TOOLS:
+        stop = str(inp.get("task_id") or inp.get("shell_id") or inp.get("bash_id") or inp.get("id") or "")
+        return [t for t in tasks if t["id"] != stop]
+    if inp.get("run_in_background") and isinstance(resp, dict):
+        tid = next((str(resp[k]) for k in BG_ID_KEYS if resp.get(k)), "")
+        if tid and all(t["id"] != tid for t in tasks):
+            label = inp.get("description") or inp.get("command") or inp.get("prompt") or data.get("tool_name") or ""
+            tasks.append({"id": tid, "label": " ".join(str(label).split())[:60], "started": round(time.time(), 1)})
+    return tasks
+
 
 def resolve_state(event, data):
     # Narzędzia pomocniczych agentów (subagent, agent uruchomiony przez hook Stop) mają "agent_id".
@@ -299,6 +333,7 @@ def main():
         "transcript_path": data.get("transcript_path") or prev.get("transcript_path"),
         "pid": prev.get("pid"),
         "pid_created": prev.get("pid_created"),
+        "background": background_tasks(event, data, prev),
         "compact_trigger": data.get("trigger") if state == COMPACTING else prev.get("compact_trigger"),
     }
     if state == COMPACTING:

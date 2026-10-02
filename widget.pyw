@@ -45,16 +45,19 @@ MEDIA_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Media")
 
 IDLE, WORKING, WAITING, STALE, ERROR = "idle", "working", "waiting", "stale", "error"
 COMPACTING = "compacting"  # kompaktowanie (streszczanie) kontekstu rozmowy
+BACKGROUND = "background"  # agent czeka na Ciebie, ale w tle działa jego zadanie (komenda, pomocniczy agent)
 OFFLINE = "offline"  # tylko stan zbiorczy: brak jakiejkolwiek sesji
 BUSY = (WORKING, WAITING)
 LABEL = {IDLE: "bezczynny", WORKING: "pracuje", WAITING: "czeka na Ciebie", STALE: "zawieszona", ERROR: "błąd",
-         COMPACTING: "kompaktuje kontekst"}
+         COMPACTING: "kompaktuje kontekst", BACKGROUND: "zadanie w tle"}
 CLI_NAME = {"claude": "Claude Code", "gemini": "Gemini CLI", "codex": "Codex CLI"}
 
 GLITCH = QColor(220, 70, 255)  # błąd tury / zawieszona sesja
 # praca w przygaszonej, butelkowej zieleni „Matrixa”, bezczynność jako zimny, biało-turkusowy terminal
 COLOR = {WORKING: QColor(27, 196, 106), IDLE: QColor(159, 232, 224), WAITING: QColor(255, 162, 31),
          COMPACTING: QColor(64, 156, 255), ERROR: GLITCH, STALE: GLITCH, OFFLINE: QColor(120, 128, 138)}
+COLOR[BACKGROUND] = COLOR[IDLE]  # jak bezczynny: agent czeka na Ciebie
+BACKGROUND_DOTS = QColor(255, 75, 58)  # czerwone kropki „zadanie w tle trwa”
 KNOWN_STATES = (IDLE, WORKING, WAITING, ERROR, COMPACTING)  # stany, które może zapisać hook
 
 DEFAULTS = {
@@ -125,6 +128,9 @@ EN = {
     "zawieszona": "stalled",
     "błąd": "error",
     "kompaktuje kontekst": "compacting context",
+    "zadanie w tle": "background task",
+    "{n} z zadaniem w tle": "{n} with a background task",
+    "w tle: {label} ({time})": "background: {label} ({time})",
     "{n} czeka na Ciebie": "{n} waiting for you",
     "{n} z błędem lub zawieszona": "{n} with error or stalled",
     "{n} kompaktuje kontekst": "{n} compacting context",
@@ -334,6 +340,8 @@ def load_sessions(cfg):
         s["_raw_state"] = s.get("state")
         if s.get("state") == IDLE and s.get("question") and cfg["question_waiting"]:
             s["state"] = WAITING  # agent skończył odpowiedź pytaniem i czeka na Ciebie
+        elif s.get("state") == IDLE and s.get("background"):
+            s["state"] = BACKGROUND  # agent skończył turę, ale jego zadanie w tle jeszcze trwa
         # "brak sygnału" tylko dla pracy bez zdarzeń; czekanie na Ciebie może trwać dowolnie długo
         if s.get("state") == WORKING and age > cfg["stale_minutes"] * 60:
             s["state"] = STALE
@@ -353,7 +361,8 @@ def _remove(path):
 
 
 def aggregate(sessions):
-    """Stan zbiorczy: czekanie > błąd albo zawieszenie > kompaktowanie > praca > bezczynność; bez sesji – offline."""
+    """Stan zbiorczy: czekanie > błąd albo zawieszenie > kompaktowanie > praca > zadanie w tle > bezczynność;
+    bez sesji – offline."""
     if not sessions:
         return OFFLINE
     states = {s.get("state") for s in sessions}
@@ -365,6 +374,8 @@ def aggregate(sessions):
         return COMPACTING
     if WORKING in states:
         return WORKING
+    if BACKGROUND in states:
+        return BACKGROUND
     return IDLE
 
 
@@ -688,7 +699,7 @@ class Light(QWidget):
             if self._prev is not None and before != st:
                 if st == WAITING:
                     events.append(("waiting", s))
-                elif st == IDLE and before in BUSY and s.get("event") != "Interrupted":
+                elif st in (IDLE, BACKGROUND) and before in BUSY and s.get("event") != "Interrupted":
                     dur = s.get("last_work_seconds") or 0
                     if self.cfg["notify_long_task"] and dur >= self.cfg["long_task_minutes"] * 60:
                         events.append(("done", s))
@@ -707,6 +718,7 @@ class Light(QWidget):
         n_err = sum(s["state"] in (ERROR, STALE) for s in self.sessions)
         n_work = sum(s["state"] == WORKING for s in self.sessions)
         n_compact = sum(s["state"] == COMPACTING for s in self.sessions)
+        n_bg = sum(s["state"] == BACKGROUND for s in self.sessions)
         if n_wait:
             return T("{n} czeka na Ciebie").format(n=n_wait)
         if n_err:
@@ -715,6 +727,8 @@ class Light(QWidget):
             return T("{n} kompaktuje kontekst").format(n=n_compact)
         if n_work:
             return T("{n} pracuje").format(n=n_work)
+        if n_bg:
+            return T("{n} z zadaniem w tle").format(n=n_bg)
         return T("wszyscy wolni") if self.sessions else T("brak aktywnych sesji")
 
     def session_line(self, s):
@@ -727,7 +741,11 @@ class Light(QWidget):
     def session_text(self, s):
         """Linia sesji, a pod nią szczegół (narzędzie, pytanie, błąd), gdy sesja nie jest bezczynna."""
         line = self.session_line(s)
-        if s["state"] != IDLE and s.get("detail"):
+        if s["state"] == BACKGROUND:
+            for task in s.get("background") or []:
+                elapsed = fmt_duration(time.time() - float(task.get("started") or time.time()))
+                line += "\n    " + T("w tle: {label} ({time})").format(label=task.get("label") or "?", time=elapsed)
+        elif s["state"] != IDLE and s.get("detail"):
             line += f"\n    {T(s['detail'])}"
         return line
 
@@ -999,9 +1017,16 @@ class Light(QWidget):
         elif st == WAITING:
             glitch = (now * 2.3) % 1 < 0.12  # na moment rozszczepienie na cyjan i magentę
             self._paint_glyph(p, screen, s, "?", col, 14 * s, Qt.AlignCenter, glitch)
-        elif st == IDLE:  # znak zachęty w lewym dolnym rogu, jak w terminalu
+        elif st in (IDLE, BACKGROUND):  # znak zachęty w lewym dolnym rogu, jak w terminalu
+            if st == BACKGROUND:  # „duch” deszczu: przygaszony i wolniejszy – w tle coś się liczy
+                p.save()
+                p.setOpacity(0.28)
+                self._paint_rain(p, screen, s, now * 0.45, COLOR[WORKING])
+                p.restore()
             prompt = screen.adjusted(2.5 * s, 2 * s, -2 * s, -1.5 * s)
             self._paint_glyph(p, prompt, s, ">_" if int(now * 2) % 2 else ">", col, 8 * s, Qt.AlignLeft | Qt.AlignBottom)
+            if st == BACKGROUND:
+                self._paint_busy_dots(p, screen, s, now)
         p.fillRect(screen, self._scanlines(s))  # linie skanowania jak na monitorze kineskopowym
         p.restore()
 
@@ -1027,6 +1052,17 @@ class Light(QWidget):
         p.setPen(Qt.NoPen)
         p.setBrush(grad)
         p.drawEllipse(c, r, r)
+
+    @staticmethod
+    def _paint_busy_dots(p, rect, s, now):
+        """Trzy czerwone kropki w prawym górnym rogu zapalające się po kolei – zadanie w tle trwa."""
+        r = 1.1 * s
+        p.setPen(Qt.NoPen)
+        for i in range(3):
+            c = QColor(BACKGROUND_DOTS)
+            c.setAlphaF(1.0 if int(now * 3) % 3 == i else 0.25)
+            p.setBrush(c)
+            p.drawEllipse(QPointF(rect.right() - 3 * s - (2 - i) * 3.2 * s, rect.top() + 3.5 * s), r, r)
 
     def _paint_noise(self, p, rect, s, now):
         """Szum jak na wyłączonym telewizorze: szare ziarno i wolno przesuwający się jaśniejszy pas.
