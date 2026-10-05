@@ -116,7 +116,10 @@ def background_tasks(event, data, prev):
     if data.get("tool_name") in STOP_TOOLS:
         stop = str(inp.get("task_id") or inp.get("shell_id") or inp.get("bash_id") or inp.get("id") or "")
         return [t for t in tasks if t["id"] != stop]
-    if inp.get("run_in_background") and isinstance(resp, dict):
+    # komenda w tle ma "run_in_background" w wejściu; agent uruchamia się w tle domyślnie i mówi o tym
+    # dopiero odpowiedź narzędzia ("isAsync": true, "status": "async_launched")
+    is_async = isinstance(resp, dict) and (resp.get("isAsync") or resp.get("status") == "async_launched")
+    if (inp.get("run_in_background") or is_async) and isinstance(resp, dict):
         tid = next((str(resp[k]) for k in BG_ID_KEYS if resp.get(k)), "")
         if tid and all(t["id"] != tid for t in tasks):
             label = inp.get("description") or inp.get("command") or inp.get("prompt") or data.get("tool_name") or ""
